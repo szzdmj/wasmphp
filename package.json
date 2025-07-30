@@ -1,6 +1,12 @@
 {
+  "name": "wasmphp",
+  "version": "1.0.0",
   "type": "module",
+  "scripts": {
+    "start": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
   "dependencies": {
-    "@php-wasm/web": "^0.4.0"
+    "@php-wasm/web": "0.3.4"
   }
 }
