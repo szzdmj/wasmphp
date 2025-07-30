@@ -1,17 +1,18 @@
-import { PHP } from "@php-wasm/web";
+import { PHP } from '@php-wasm/web'; // 浏览器环境适用
+
+const php = await PHP.load('8.0', {
+  requestHandler: { documentRoot: '/app/public' } // 访问路径
+});
 
 export default {
   async fetch(request: Request): Promise<Response> {
-    const php = await PHP.load("8.0", {
-      requestHandler: { documentRoot: "/www" }
-    });
-    // 写入文件结构，例如 public/index.php
-    php.mkdirTree("/www");
-    php.writeFile("/www/index.php", `<?php echo "Hello from PHP‑WASM!"; ?>`);
-    const resp = await php.request({
-      method: request.method,
-      url: request.url.replace(location.origin, ""),
-    });
-    return new Response(resp.text, { status: resp.status });
+    const url = new URL(request.url);
+    if (url.pathname === '/phpinfo') {
+      php.writeFile('/app/public/info.php', `<?php phpinfo(); ?>`);
+      const response = await php.run({ scriptPath: '/app/public/info.php' });
+      return new Response(response.text, { headers: { 'Content-Type': 'text/html' } });
+    }
+    // 默认返回静态文件或提示
+    return new Response('Choose /phpinfo', { status: 200, headers: { 'Content-Type': 'text/plain' } });
   }
-};
+}
