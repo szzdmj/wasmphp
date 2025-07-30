@@ -1,13 +1,13 @@
-import { createPHP } from "@php-wasm/web";
+import { loadPHP } from "@php-wasm/web";
 
 export default {
-  async fetch(request: Request): Promise<Response> {
-    const php = await createPHP();
+  async fetch(req: Request): Promise<Response> {
+    const php = await loadPHP();
 
-    const output = await php.run(`<?php echo "Hello from PHP running inside Cloudflare Worker!"; ?>`);
+    const script = `<?php echo "Hello from PHP running inside Cloudflare Worker!"; ?>`;
 
-    return new Response(output.stdout, {
-      headers: { "Content-Type": "text/plain" },
-    });
+    const output = await php.run(script);
+
+    return new Response(output);
   },
 };
