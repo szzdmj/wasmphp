@@ -1,32 +1,14 @@
-import phpWasm from "@php-wasm/web";
+import { php } from "@php-wasm/web";
 
 export default {
   async fetch(request: Request): Promise<Response> {
-    const php = await phpWasm({
-      // 你可以配置 php.ini 设置或不设置
-      ini: "",
-      requestHandler: {
-        async handle(path, output) {
-          if (path === "/index.php") {
-            output.write(`<?php echo "Hello from PHP running inside Cloudflare Worker!"; ?>`);
-          } else {
-            output.write("<?php http_response_code(404); echo 'Not Found'; ?>");
-          }
-        },
-      },
-    });
+    const phpInstance = await php();
 
-    const url = new URL(request.url);
-    const phpResponse = await php.run({
-      method: request.method,
-      headers: Object.fromEntries(request.headers),
-      body: request.body ? await request.text() : undefined,
-      uri: url.pathname,
-    });
+    const script = `<?php echo "Hello from PHP running inside Cloudflare Worker!"; ?>`;
+    const output = await phpInstance.run(script);
 
-    return new Response(phpResponse.body, {
-      status: phpResponse.status,
-      headers: phpResponse.headers,
+    return new Response(output.stdout, {
+      headers: { "Content-Type": "text/plain" },
     });
   },
 };
