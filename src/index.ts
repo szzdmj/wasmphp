@@ -1,5 +1,4 @@
-import { PHP } from "@php-wasm/web";
-
+import phpWasm from "@php-wasm/web";
 export default {
   async fetch(req: Request): Promise<Response> {
     const php = new PHP({
