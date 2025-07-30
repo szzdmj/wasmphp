@@ -1,9 +1,16 @@
 {
   "name": "wasmphp",
   "compatibility_date": "2025-07-30",
+
+  // 使用 module worker 入口
   "main": "src/index.ts",
-  "site": {
-    "bucket": "./public",
-    "include": ["**/*"]
+  "type": "module",
+
+  // Cloudflare Pages / Workers 部署目标
+  "workers_dev": true,
+
+  // 自定义构建命令（可选）
+  "build": {
+    "command": "npm install"
   }
 }
