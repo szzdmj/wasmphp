@@ -1,27 +1,21 @@
-// src/index.ts
 import { PHP } from "@php-wasm/web";
+
+// 读取 public/index.php 内容（建议放在 assets 中供 fetch）
+const INDEX_PHP_URL = new URL("../public/index.php", import.meta.url).href;
 
 export default {
   async fetch(request: Request): Promise<Response> {
-    const php = await PHP.load("8.2", {
-      wasmBinaryPath: "/php/php.wasm", // 映射 assets 中的 wasm
-      documentRoot: "/",
-      initialFiles: {
-        "/index.php": `
-        <?php
-          echo "PHP is working! Time: " . date('Y-m-d H:i:s');
-        `
-      }
-    });
+    // 获取 index.php 的源码
+    const phpCodeResp = await fetch(INDEX_PHP_URL);
+    if (!phpCodeResp.ok) {
+      return new Response("Failed to load index.php", { status: 500 });
+    }
+    const phpCode = await phpCodeResp.text();
 
-    const response = await php.request({
-      method: "GET",
-      relativeUrl: "/index.php"
-    });
+    // 初始化 PHP-WASM 实例（默认使用 web 适配版本）
+    const php = await PHP.load();
 
-    return new Response(response.body, {
-      status: response.statusCode,
-      headers: Object.fromEntries(response.headers),
-    });
-  }
-};
+    // 执行 PHP 代码
+    const result = await php.run(phpCode);
+
+    // 返回结果
