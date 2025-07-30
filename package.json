@@ -7,6 +7,6 @@
     "deploy": "wrangler deploy"
   },
   "dependencies": {
-    "@php-wasm/web": "0.3.4"
+    "@php-wasm/web": "2.0.5"
   }
 }
