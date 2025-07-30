@@ -1,9 +1,9 @@
-import { PHP } from "@php-wasm/web";
+import phpWasm from "@php-wasm/web";
 
 export default {
   async fetch(request: Request): Promise<Response> {
-    const php = new PHP({
-      // 将 php.ini 内容设置为空或最小化
+    const php = await phpWasm({
+      // 你可以配置 php.ini 设置或不设置
       ini: "",
       requestHandler: {
         async handle(path, output) {
@@ -12,7 +12,7 @@ export default {
           } else {
             output.write("<?php http_response_code(404); echo 'Not Found'; ?>");
           }
-        }
+        },
       },
     });
 
@@ -28,5 +28,5 @@ export default {
       status: phpResponse.status,
       headers: phpResponse.headers,
     });
-  }
+  },
 };
