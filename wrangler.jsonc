@@ -1,10 +1,1 @@
-{
-  "name": "wasmphp",
-  "compatibility_date": "2025-07-30",
-  "main": "src/index.ts",
-  "type": "module",
-  "workers_dev": true,
-  "build": {
-    "command": "npm install"
-  }
-}
+wrangler.jsonc
