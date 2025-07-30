@@ -1,0 +1,16 @@
+{
+  "name": "php-worker-wasm",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "wrangler dev",
+    "deploy": "wrangler publish"
+  },
+  "dependencies": {
+    "php-cgi-wasm": "^0.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "wrangler": "^3.60.0"
+  }
+}
