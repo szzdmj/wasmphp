@@ -1,4 +1,4 @@
-import { createPHP } from "@php-wasm/web/dist/php-wasm-web.js";
+import { createPHP } from "@php-wasm/web";
 
 export default {
   async fetch(request: Request): Promise<Response> {
