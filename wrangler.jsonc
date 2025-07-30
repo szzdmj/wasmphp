@@ -3,12 +3,11 @@
   "main": "src/index.ts",
   "compatibility_date": "2025-07-30",
 
-  // ✅ 自动安装依赖
+  // ✅ 强制用 npm 安装依赖，避免 bun 无法解析
   "build": {
-    "command": "npm install"
+    "command": "npm install --legacy-peer-deps"
   },
 
-  // ✅ 上传 php.wasm 供 fetch 加载
   "assets": {
     "base_path": "./php"
   }
