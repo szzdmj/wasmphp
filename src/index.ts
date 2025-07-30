@@ -1,31 +1,32 @@
-import php from "@php-wasm/web";
+import { PHP } from "@php-wasm/web";
 
 export default {
   async fetch(request: Request): Promise<Response> {
-    await php.ready;
+    const php = new PHP({
+      // 将 php.ini 内容设置为空或最小化
+      ini: "",
+      requestHandler: {
+        async handle(path, output) {
+          if (path === "/index.php") {
+            output.write(`<?php echo "Hello from PHP running inside Cloudflare Worker!"; ?>`);
+          } else {
+            output.write("<?php http_response_code(404); echo 'Not Found'; ?>");
+          }
+        }
+      },
+    });
 
-    // 读取 public/index.php 的内容
-    const phpScript = `<?php echo "Hello from PHP running inside Cloudflare Worker!"; ?>`;
+    const url = new URL(request.url);
+    const phpResponse = await php.run({
+      method: request.method,
+      headers: Object.fromEntries(request.headers),
+      body: request.body ? await request.text() : undefined,
+      uri: url.pathname,
+    });
 
-    try {
-      // 清空之前的输出缓存（可选）
-      php.module.ccall("clear_output", null, [], []);
-
-      // 运行 PHP 脚本
-      const result = php.run(phpScript);
-
-      return new Response(result, {
-        headers: {
-          "Content-Type": "text/html; charset=utf-8",
-        },
-      });
-    } catch (e) {
-      return new Response(`PHP Runtime Error: ${e}`, {
-        status: 500,
-        headers: {
-          "Content-Type": "text/plain; charset=utf-8",
-        },
-      });
-    }
-  },
+    return new Response(phpResponse.body, {
+      status: phpResponse.status,
+      headers: phpResponse.headers,
+    });
+  }
 };
