@@ -1,0 +1,9 @@
+{
+  "name": "wasmphp",
+  "compatibility_date": "2025-07-30",
+  "main": "src/index.ts",
+  "site": {
+    "bucket": "./public",
+    "include": ["**/*"]
+  }
+}
