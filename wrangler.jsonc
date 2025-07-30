@@ -1,10 +1,20 @@
 {
   "name": "wasmphp",
-  "main": "src/index.ts",
   "compatibility_date": "2025-07-30",
   "type": "javascript",
-  "node_compat": true,
   "build": {
-    "command": "npm install"
+    // 强制使用 npm 安装
+    "command": "npm install && echo 'npm install done'",
+    "cwd": "."
+  },
+  "site": {
+    "bucket": "./public"
+  },
+  "routes": [
+    { "pattern": "wasmphp.example.workers.dev/*", "zone_name": "example.com" }
+  ],
+  "upload": {
+    "format": "modules",
+    "main": "./src/index.ts"
   }
 }
