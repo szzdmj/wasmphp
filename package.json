@@ -1,11 +1,5 @@
 {
-  "name": "wasmphp",
-  "version": "0.0.1",
-  "type": "module",
-  "scripts": {
-    "start": "wrangler dev"
-  },
   "dependencies": {
-    "php-cgi-wasm": "0.1.0"
+    "php-cgi-wasm": "latest"
   }
 }
