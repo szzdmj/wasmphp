@@ -1,11 +1,14 @@
 {
-  "name": "wasmphp",
+  "name": "php-wasm-worker",
   "compatibility_date": "2025-07-30",
-  // 无 container/durable_objects，仅纯 worker
-  "main": "src/index.ts",
-  "compatibility_flags": ["nodejs_compat"],
-
-  "assets": {
-    "directory": "./public"
+  "type": "javascript",
+  "build": {
+    "upload": {
+      "format": "modules",
+      "dir": "src"
+    }
+  },
+  "site": {
+    "bucket": "./public"
   }
 }
