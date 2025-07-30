@@ -1,19 +1,12 @@
 {
   "name": "wasmphp",
   "compatibility_date": "2025-07-30",
+  "main": "src/index.ts",
   "type": "javascript",
-
-  // 👇 强制使用 npm 而不是 bun 安装依赖
   "build": {
-    "command": "npm install"
+    "command": "npm install && npm run build"
   },
-
-  "upload": {
-    "format": "modules",
-    "main": "./src/index.ts"
-  },
-
-  "site": {
-    "bucket": "./public"
+  "assets": {
+    "directory": "public"
   }
 }
