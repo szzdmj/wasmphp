@@ -1,14 +1,8 @@
 {
-  "name": "php-wasm-worker",
+  "name": "wasmphp",
+  "main": "src/index.ts",
   "compatibility_date": "2025-07-30",
-  "type": "javascript",
-  "build": {
-    "upload": {
-      "format": "modules",
-      "dir": "src"
-    }
-  },
-  "site": {
-    "bucket": "./public"
-  }
+  "compatibility_flags": [
+    "nodejs_compat"
+  ]
 }
