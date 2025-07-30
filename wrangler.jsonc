@@ -2,19 +2,18 @@
   "name": "wasmphp",
   "compatibility_date": "2025-07-30",
   "type": "javascript",
+
+  // 👇 强制使用 npm 而不是 bun 安装依赖
   "build": {
-    // 强制使用 npm 安装
-    "command": "npm install && echo 'npm install done'",
-    "cwd": "."
+    "command": "npm install"
   },
-  "site": {
-    "bucket": "./public"
-  },
-  "routes": [
-    { "pattern": "wasmphp.example.workers.dev/*", "zone_name": "example.com" }
-  ],
+
   "upload": {
     "format": "modules",
     "main": "./src/index.ts"
+  },
+
+  "site": {
+    "bucket": "./public"
   }
 }
