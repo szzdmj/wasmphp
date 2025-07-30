@@ -1,13 +1,27 @@
-import { PhpCgiWorker } from "php-cgi-wasm/PhpCgiWorker";
+// src/index.ts
+import { PHP } from "@php-wasm/web";
 
-const php = new PhpCgiWorker({
-  prefix: "/",
-  docroot: "/persist/www",
-  types: {
-    php: "application/x-httpd-php"
+export default {
+  async fetch(request: Request): Promise<Response> {
+    const php = await PHP.load("8.2", {
+      wasmBinaryPath: "/php/php.wasm", // 映射 assets 中的 wasm
+      documentRoot: "/",
+      initialFiles: {
+        "/index.php": `
+        <?php
+          echo "PHP is working! Time: " . date('Y-m-d H:i:s');
+        `
+      }
+    });
+
+    const response = await php.request({
+      method: "GET",
+      relativeUrl: "/index.php"
+    });
+
+    return new Response(response.body, {
+      status: response.statusCode,
+      headers: Object.fromEntries(response.headers),
+    });
   }
-});
-
-self.addEventListener("install", event => php.handleInstallEvent(event));
-self.addEventListener("activate", event => php.handleActivateEvent(event));
-self.addEventListener("fetch", event => php.handleFetchEvent(event));
+};
