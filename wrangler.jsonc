@@ -2,13 +2,9 @@
   "name": "wasmphp",
   "main": "src/index.ts",
   "compatibility_date": "2025-07-30",
-
-  // ✅ 强制用 npm 安装依赖，避免 bun 无法解析
+  "node_compat": true,
+  "type": "javascript",
   "build": {
-    "command": "npm install --legacy-peer-deps"
-  },
-
-  "assets": {
-    "base_path": "./php"
+    "command": "npm install"
   }
 }
