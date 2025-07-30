@@ -1,12 +1,11 @@
 {
-  "name": "wasmphp",
+  "name": "php-wasm-worker",
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "start": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "build": "echo 'no build step'"
   },
   "dependencies": {
-    "@php-wasm/web": "2.0.5"
+    "@php-wasm/web": "^2.0.5"
   }
 }
