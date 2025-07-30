@@ -1,16 +1,11 @@
 {
-  "name": "php-worker-wasm",
-  "private": true,
+  "name": "wasmphp",
+  "version": "0.0.1",
   "type": "module",
   "scripts": {
-    "start": "wrangler dev",
-    "deploy": "wrangler publish"
+    "start": "wrangler dev"
   },
   "dependencies": {
-    "php-cgi-wasm": "^0.1.0"
-  },
-  "devDependencies": {
-    "typescript": "^5.4.0",
-    "wrangler": "^3.60.0"
+    "php-cgi-wasm": "0.1.0"
   }
 }
