@@ -2,8 +2,8 @@
   "name": "wasmphp",
   "main": "src/index.ts",
   "compatibility_date": "2025-07-30",
-  "node_compat": true,
   "type": "javascript",
+  "node_compat": true,
   "build": {
     "command": "npm install"
   }
