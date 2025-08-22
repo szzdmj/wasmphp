@@ -1,28 +1,8 @@
 {
-  "name": "@php-wasm/web",
-  "version": "2.0.11",
-  "type": "module",
-  "main": "index.js",
-  "exports": {
-    ".": {
-      "import": "./index.js"
-    },
-    "./php/asyncify/8_4_10/php_8_4.js": {
-      "import": "./php/asyncify/8_4_10/php_8_4.js"
-    }
+  "dependencies": {
+    "@php-wasm/web": "^2.0.11"
   },
-  "files": [
-    "index.js",
-    "php/",
-    "shared/"
-  ],
-  "dependencies": {},
-  "description": "PHP WebAssembly runtime for JavaScript environments.",
-  "keywords": [
-    "php",
-    "wasm",
-    "webassembly"
-  ],
-  "author": "php-wasm authors",
-  "license": "MIT"
+  "scripts": {
+    "postinstall": "bash scripts/clean-php-wasm.sh && patch-package"
+  }
 }
