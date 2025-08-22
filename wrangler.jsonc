@@ -7,7 +7,7 @@
   ],
   // Worker 打包后入口文件路径
   "main": "dist/worker.js",
-  // 自定义构建命令，使用 esbuild.config.mjs 进行打包（推荐 alias 方案消除 node:events 等 import）
+  // 使用自定义 esbuild 配置进行打包（需保证 esbuild 已正确安装到 devDependencies）
   "build": {
     "command": "node esbuild.config.mjs"
   },
