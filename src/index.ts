@@ -4,7 +4,7 @@ export default {
   async fetch(req: Request): Promise<Response> {
     // 使用正确的工厂函数
     const php = await phpWasmModule.init(
-      "WEB", // 或 "WORKER"，根据你的环境
+      "WORKER", // 或 "WEB"，根据你的环境
       {
         print: (text: string) => console.log("PHP output:", text),
       }
