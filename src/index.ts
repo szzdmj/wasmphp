@@ -1,12 +1,15 @@
-import * as phpWasm from "@php-wasm/web";
+import phpWasmFactory from "../node_modules/@php-wasm/web/php/asyncify/8_4_10/php_8_4.js";
 
+// 你可以直接用工厂函数，无需 @php-wasm/web 的入口
 export default {
   async fetch(req: Request): Promise<Response> {
-    const php = await phpWasm.default({
+    const php = await phpWasmFactory({
       print: (text: string) => console.log("PHP output:", text),
     });
 
-    await php.mount({ "index.php": `<?php echo "Hello from PHP running inside Cloudflare Worker!"; ?>` });
+    await php.mount({
+      "index.php": `<?php echo "Hello from PHP running inside Cloudflare Worker!"; ?>`,
+    });
 
     const result = await php.run("index.php");
 
