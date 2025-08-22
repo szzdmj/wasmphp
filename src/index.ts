@@ -1,6 +1,5 @@
-import phpWasmFactory from "../node_modules/@php-wasm/web/php/asyncify/8_4_10/php_8_4.js";
+import phpWasmFactory from "@php-wasm/web/php/asyncify/8_4_10/php_8_4.js";
 
-// 你可以直接用工厂函数，无需 @php-wasm/web 的入口
 export default {
   async fetch(req: Request): Promise<Response> {
     const php = await phpWasmFactory({
