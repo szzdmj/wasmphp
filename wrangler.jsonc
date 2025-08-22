@@ -6,8 +6,8 @@
   // Worker 入口文件路径
   "main": "dist/worker.js",
   "build": {
-    // 构建命令，打包 TypeScript 入口为 Worker 文件，并排除 node-only 模块
-    "command": "esbuild src/index.ts --bundle --outfile=dist/worker.js --loader:.dat=file --external:events --external:child_process"
+    // 构建命令，打包 TypeScript 入口为 Worker 文件，并排除 node-only 模块，添加 dat/wasm loader
+    "command": "esbuild src/index.ts --bundle --outfile=dist/worker.js --loader:.dat=file --loader:.wasm=file --external:events --external:child_process"
   },
   // 静态资源规则，将 wasm 和 dat 文件作为 Data asset 上传
   "rules": [
