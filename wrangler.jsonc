@@ -2,9 +2,8 @@
   "name": "wasmphp",
   "compatibility_date": "2025-07-30",
   "compatibility_flags": ["nodejs_compat"],
-  "main": "src/index.ts",
+  "main": "dist/worker.js",
   "build": {
-    // esbuild 自动为 .dat 配置 file loader
     "command": "esbuild src/index.ts --bundle --outfile=dist/worker.js --loader:.dat=file"
   },
   "rules": [
