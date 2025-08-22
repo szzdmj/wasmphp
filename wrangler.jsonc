@@ -6,7 +6,7 @@
   // Worker 入口文件路径
   "main": "dist/worker.js",
 "build": {
-  "command": "esbuild src/index.ts --bundle --outfile=dist/worker.js --loader:.dat=file --loader:.wasm=file --external:events --external:child_process --external:node:events --external:node:perf_hooks --external:node:stream --external:node:tty"
+    "command": "esbuild src/index.ts --bundle --outfile=dist/worker.js --platform=browser --target=esnext --loader:.dat=file --loader:.wasm=file --external:events --external:child_process"
 },
   // 静态资源规则，将 wasm 和 dat 文件作为 Data asset 上传
   "rules": [
