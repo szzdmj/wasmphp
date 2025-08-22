@@ -1,18 +1,6 @@
-import * as phpWasm from "@php-wasm/web";
+// 极简 asyncify 8.4 版本，仅导出 asyncify/8_4_10/php_8_4.js 的默认工厂函数。
+// 注意：需配合 package.json/main 指向此文件，并且确保只保留 asyncify/8_4_10/php_8_4.js 及相关 wasm/dat 文件。
 
-export default {
-  async fetch(req: Request): Promise<Response> {
-    // 2.x 的 phpWasm 主体是 async 工厂函数
-    const php = await phpWasm.default({
-      print: (text: string) => console.log("PHP output:", text),
-    });
+const phpWasmAsyncify84 = require('./php/asyncify/8_4_10/php_8_4.js');
 
-    await php.mount({ "index.php": `<?php echo "Hello from PHP running inside Cloudflare Worker!"; ?>` });
-
-    const result = await php.run("index.php");
-
-    return new Response(result.stdout, {
-      headers: { "content-type": "text/html; charset=utf-8" },
-    });
-  },
-};
+module.exports = phpWasmAsyncify84;
