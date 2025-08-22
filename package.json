@@ -1,8 +1,24 @@
 {
-  "dependencies": {
-    "@php-wasm/web": "^2.0.11"
+  "name": "@php-wasm/web",
+  "version": "2.0.11",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": {
+      "import": "./index.js"
+    },
+    "./php/asyncify/8_4_10/php_8_4.js": {
+      "import": "./php/asyncify/8_4_10/php_8_4.js"
+    }
   },
-  "scripts": {
-    "postinstall": "bash scripts/clean-php-wasm.sh"
-  }
+  "files": [
+    "index.js",
+    "php/",
+    "shared/"
+  ],
+  "dependencies": {},
+  "description": "...",
+  "keywords": [],
+  "author": "...",
+  "license": "MIT"
 }
