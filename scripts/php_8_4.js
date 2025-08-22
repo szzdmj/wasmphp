@@ -1,4 +1,4 @@
-import dependencyFilename from './8_4_10/php_8_4.wasm'; 
+import dependencyFilename from './php_8_4.wasm';
 export { dependencyFilename }; 
 export const dependenciesTotalSize = 20087917; 
 const phpVersionString = '8.4.10';
