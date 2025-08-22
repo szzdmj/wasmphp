@@ -2,9 +2,8 @@ import * as phpWasmModule from "@php-wasm/web/php/asyncify/8_4_10/php_8_4.js";
 
 export default {
   async fetch(req: Request): Promise<Response> {
-    // 环境建议用 "WORKER"
     const php = await phpWasmModule.init(
-      "WORKER",
+      "WORKER", // 推荐用 "WORKER" 环境，Cloudflare Worker 专用
       {
         print: (text: string) => console.log("PHP output:", text),
       }
