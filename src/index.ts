@@ -1,9 +1,9 @@
-import phpWasm from "@php-wasm/web";
+import * as phpWasm from "@php-wasm/web";
 
 export default {
   async fetch(req: Request): Promise<Response> {
-    // 2.x 的 phpWasm 是异步工厂函数
-    const php = await phpWasm({
+    // 2.x 的 phpWasm 主体是 async 工厂函数
+    const php = await phpWasm.default({
       print: (text: string) => console.log("PHP output:", text),
     });
 
