@@ -1,6 +1,8 @@
 {
+  "dependencies": {
+    "@php-wasm/web": "^2.0.11"
+  },
   "scripts": {
-    "postinstall": "bash scripts/clean-php-wasm.sh",
-    "deploy": "wrangler deploy"
+    "postinstall": "bash scripts/clean-php-wasm.sh"
   }
 }
