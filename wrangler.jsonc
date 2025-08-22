@@ -1,4 +1,3 @@
-// wrangler.jsonc
 {
   "name": "wasmphp",
   "compatibility_date": "2025-07-30",
@@ -11,8 +10,11 @@
   "rules": [
     {
       "type": "Data",
-      "globs": ["**/*.dat"],
-      "fallthrough": true
+      // 只包含 PHP 8.4 需要的 .wasm 和 .dat 资源，避免体积超限
+      "globs": [
+        "node_modules/@php-wasm/web/php/asyncify/8_4_10/php_8_4.wasm",
+        "node_modules/@php-wasm/web/shared/icudt74l.dat"
+      ]
     }
   ],
   "site": {
