@@ -1,5 +1,4 @@
 import { build } from 'esbuild';
-import ignore from 'esbuild-plugin-ignore';
 
 build({
   entryPoints: ['src/index.ts'],
@@ -8,5 +7,14 @@ build({
   platform: 'browser',
   target: 'esnext',
   loader: { '.dat': 'file', '.wasm': 'file' },
-  plugins: [ignore(['node:events', 'node:perf_hooks', 'node:stream', 'node:tty'])],
+  alias: {
+    'node:events': './shims/empty.js',
+    'node:perf_hooks': './shims/empty.js',
+    'node:stream': './shims/empty.js',
+    'node:tty': './shims/empty.js',
+    events: './shims/empty.js',        // 有些包可能直接 import 'events'
+    perf_hooks: './shims/empty.js',
+    stream: './shims/empty.js',
+    tty: './shims/empty.js',
+  },
 });
