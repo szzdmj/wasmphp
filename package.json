@@ -16,9 +16,8 @@
     "php/",
     "shared/"
   ],
-  "dependencies": {},
-  "description": "...",
-  "keywords": [],
-  "author": "...",
+  "description": "PHP WebAssembly runtime for JavaScript environments.",
+  "keywords": ["php", "wasm", "webassembly"],
+  "author": "php-wasm authors",
   "license": "MIT"
 }
