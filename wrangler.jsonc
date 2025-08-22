@@ -1,11 +1,15 @@
 {
   "name": "wasmphp",
   "compatibility_date": "2025-07-30",
+  // 启用 Node.js 兼容层（使 Cloudflare Workers 支持部分 Node API）
   "compatibility_flags": ["nodejs_compat"],
+  // Worker 入口文件路径
   "main": "dist/worker.js",
   "build": {
+    // 构建命令，打包 TypeScript 入口为 Worker 文件
     "command": "esbuild src/index.ts --bundle --outfile=dist/worker.js --loader:.dat=file"
   },
+  // 静态资源规则，将 wasm 和 dat 文件作为 Data asset 上传
   "rules": [
     {
       "type": "Data",
@@ -15,6 +19,7 @@
       ]
     }
   ],
+  // 可选，静态网站资源目录
   "site": {
     "bucket": "./public"
   }
