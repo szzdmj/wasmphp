@@ -4,13 +4,12 @@
   "compatibility_flags": ["nodejs_compat"],
   "main": "src/index.ts",
   "build": {
-    // 如需使用 Vite 或 esbuild 手动配置 .dat loader，这里可以指定命令
-    // "command": "vite build" 或 "esbuild src/index.ts --bundle --outdir=dist --loader:.dat=file"
+    // esbuild 自动为 .dat 配置 file loader
+    "command": "esbuild src/index.ts --bundle --outfile=dist/worker.js --loader:.dat=file"
   },
   "rules": [
     {
       "type": "Data",
-      // 只包含 PHP 8.4 需要的 .wasm 和 .dat 资源，避免体积超限
       "globs": [
         "node_modules/@php-wasm/web/php/asyncify/8_4_10/php_8_4.wasm",
         "node_modules/@php-wasm/web/shared/icudt74l.dat"
