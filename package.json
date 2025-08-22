@@ -3,6 +3,6 @@
     "@php-wasm/web": "^2.0.11"
   },
   "scripts": {
-    "postinstall": "bash scripts/clean-php-wasm.sh"
+    "postinstall": "bash scripts/clean-php-wasm.sh && bash scripts/patch-php-wasm-exports.sh"
   }
 }
