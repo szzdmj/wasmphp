@@ -1,20 +1,15 @@
-import { build } from 'esbuild';
+import { build } from "esbuild";
 
 build({
-  entryPoints: ['src/index.ts'],
+  entryPoints: ["src/index.ts"],
   bundle: true,
-  outfile: 'dist/worker.js',
-  platform: 'browser',
-  target: 'esnext',
-  loader: { '.dat': 'file', '.wasm': 'file' },
-  alias: {
-    'node:events': './shims/empty.js',
-    'node:perf_hooks': './shims/empty.js',
-    'node:stream': './shims/empty.js',
-    'node:tty': './shims/empty.js',
-    events: './shims/empty.js',        // 有些包可能直接 import 'events'
-    perf_hooks: './shims/empty.js',
-    stream: './shims/empty.js',
-    tty: './shims/empty.js',
-  },
+  outfile: "dist/worker.js",
+  platform: "browser",
+  target: "esnext",
+  loader: { ".dat": "file", ".wasm": "file" },
+  external: [
+    "@php-wasm/web/php/asyncify/8_4_10/php_8_4.js",
+    "@php-wasm/web/php/asyncify/8_4_10/php_8_4.wasm",
+    "@php-wasm/web/shared/icudt74l.dat"
+  ]
 });
