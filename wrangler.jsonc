@@ -2,12 +2,15 @@
   "name": "wasmphp",
   "compatibility_date": "2025-07-30",
   // 启用 Node.js 兼容层（使 Cloudflare Workers 支持部分 Node API）
-  "compatibility_flags": ["nodejs_compat"],
-  // Worker 入口文件路径
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  // Worker 打包后入口文件路径
   "main": "dist/worker.js",
-"build": {
-  "command": "node esbuild.config.mjs"
-},
+  // 自定义构建命令，使用 esbuild.config.mjs 进行打包（推荐 alias 方案消除 node:events 等 import）
+  "build": {
+    "command": "node esbuild.config.mjs"
+  },
   // 静态资源规则，将 wasm 和 dat 文件作为 Data asset 上传
   "rules": [
     {
