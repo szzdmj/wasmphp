@@ -1,13 +1,15 @@
 {
   "name": "wasmphp",
   "version": "1.0.0",
-  "description": "PHP in WebAssembly on Cloudflare Workers",
   "type": "module",
-  "main": "src/index.ts",
+  "main": "dist/worker.js",
   "scripts": {
-    "deploy": "wrangler deploy"
+    "build": "esbuild src/index.ts --bundle --format=esm --target=esnext --outdir=dist --loader:.wasm=file --loader:.dat=file"
   },
   "dependencies": {
     "@php-wasm/web": "^2.0.11"
+  },
+  "devDependencies": {
+    "esbuild": "^0.19.0"
   }
 }
