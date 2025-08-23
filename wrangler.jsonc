@@ -2,8 +2,9 @@
   "name": "wasmphp",
   "main": "dist/index.js",
   "compatibility_date": "2025-08-23",
-  "build": {
-    "command": "npm run build"
+  // 这里配置你要绑定的 wasm 文件
+  "wasm_modules": {
+    "PHP_WASM": "scripts/php_8_4.wasm"
   },
   "rules": [
     {
