@@ -2,7 +2,6 @@
   "name": "wasmphp",
   "main": "dist/worker.js",
   "compatibility_date": "2025-08-23",
-  "compatibility_flags": ["nodejs_compat"],
   "build": {
     "command": "npm run build"
   },
@@ -10,8 +9,7 @@
     {
       "type": "Data",
       "globs": [
-        "scripts/php_8_4.wasm",
-        "node_modules/@php-wasm/web/shared/*.dat"
+        "scripts/php_8_4.wasm"
       ]
     }
   ]
