@@ -14,6 +14,15 @@ export async function init(RuntimeName, PHPLoader) {
     var thisProgram = "./this.program";
     var quit_ = (status, toThrow) => { throw toThrow };
     var scriptDirectory = "";
+    var wasmBinary = Module["wasmBinary"];
+
+    // PATCH: 强制异步 wasm 加载
+    Module.instantiateWasm = async function(importObject, successCallback) {
+      // Cloudflare Worker 支持的异步加载方式
+      const { instance } = await WebAssembly.instantiate(wasmBinary, importObject);
+      successCallback(instance);
+      return instance.exports;
+    };
     function locateFile(path) {
         if (Module["locateFile"]) {
             return Module["locateFile"](path, scriptDirectory)
