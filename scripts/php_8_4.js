@@ -18,8 +18,7 @@ throw toThrow
 var scriptDirectory="";
 function locateFile(path){if(Module["locateFile"]){return Module["locateFile"](path,scriptDirectory)}return scriptDirectory+path}
 var readAsync,readBinary;
-if(ENVIRONMENT_IS_WEB||ENVIRONMENT_IS_WORKER){if(ENVIRONMENT_IS_WORKER){scriptDirectory=self.location.href}else if(typeof document!="undefined"&&document.currentScript){scriptDirectory=document.currentScript.src}}
-// --- EventEmitter: only browser implementation, no Node require ---
+if(ENVIRONMENT_IS_WEB||ENVIRONMENT_IS_WORKER){if(ENVIRONMENT_IS_WORKER){scriptDirectory=self.location.href}
 var EventEmitter = class EventEmitter {
     constructor() { this.listeners = {}; }
     emit(eventName, data) {
@@ -73,9 +72,7 @@ ExitStatus = class PHPExitStatus extends Error {
 var addOnPreRun=cb=>onPreRuns.unshift(cb);
 var noExitRuntime=Module["noExitRuntime"]||false;var stackRestore=val=>__emscripten_stack_restore(val);var stackSave=()=>_emscripten_stack_get_current();var UTF8Decoder=typeof TextDecoder!="undefined"?new TextDecoder("utf8"):undefined;
 url = SOCKFS.websocketArgs["url"](...arguments);
-}else if ("string" === typeof SOCKFS.websocketArgs["url"]){url=SOCKFS.websocketArgs["url"]}if(SOCKFS.websocketArgs["subprotocol"]){subProtocols=SOCKFS.websocketArgs["subprotocol"]}else if(SOCKFS.websocketArgs["subprotocols"]){subProtocols=SOCKFS.websocketArgs["subprotocols"]}
-DNS.address_map.addrs.localhost = '127.0.0.1';
-
+}
 /**
  * Debugging Asyncify errors is tricky because the stack trace is lost when the
  * error is thrown. This code saves the stack trace in a global variable
