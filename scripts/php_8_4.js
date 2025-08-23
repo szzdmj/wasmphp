@@ -53,6 +53,7 @@ export async function init(RuntimeName, PHPLoader) {
             }
         };
         // --- End EventEmitter patch ---
+        var url = dependencyFilename;
         var response = await fetch(url, { credentials: "same-origin" });
         if (response.ok) { return response.arrayBuffer(); }
         throw new Error(response.status + " : " + response.url);
