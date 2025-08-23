@@ -12,13 +12,20 @@ var ENVIRONMENT_IS_NODE=RuntimeName==="NODE";
     var key, value;
 var arguments_=[];
 var thisProgram="./this.program";
-var quit_=(status,toThrow)=>{
-throw toThrow
-};
+    var quit_ = (status, toThrow) => { throw toThrow };
 var scriptDirectory="";
-function locateFile(path){if(Module["locateFile"]){return Module["locateFile"](path,scriptDirectory)}return scriptDirectory+path}
+    function locateFile(path) {
+        if (Module["locateFile"]) {
+            return Module["locateFile"](path, scriptDirectory)
+        }
+        return scriptDirectory + path
+    }
 var readAsync,readBinary;
-if(ENVIRONMENT_IS_WEB||ENVIRONMENT_IS_WORKER){if(ENVIRONMENT_IS_WORKER){scriptDirectory=self.location.href}
+    if (ENVIRONMENT_IS_WEB || ENVIRONMENT_IS_WORKER) {
+        if (ENVIRONMENT_IS_WORKER) {
+            scriptDirectory = self.location.href;
+        }
+        // --- EventEmitter: only browser implementation, no Node require ---
 var EventEmitter = class EventEmitter {
     constructor() { this.listeners = {}; }
     emit(eventName, data) {
@@ -70,9 +77,11 @@ ExitStatus = class PHPExitStatus extends Error {
     var addOnPostRun = cb => onPostRuns.unshift(cb);
     var onPreRuns = [];
 var addOnPreRun=cb=>onPreRuns.unshift(cb);
-var noExitRuntime=Module["noExitRuntime"]||false;var stackRestore=val=>__emscripten_stack_restore(val);var stackSave=()=>_emscripten_stack_get_current();var UTF8Decoder=typeof TextDecoder!="undefined"?new TextDecoder("utf8"):undefined;
-url = SOCKFS.websocketArgs["url"](...arguments);
-}
+    var noExitRuntime = Module["noExitRuntime"] || false;
+    var stackRestore = val => __emscripten_stack_restore(val);
+    var stackSave = () => _emscripten_stack_get_current();
+    var UTF8Decoder = typeof TextDecoder != "undefined" ? new TextDecoder("utf8") : undefined;
+    // url = SOCKFS.websocketArgs["url"](...arguments); // removed for Cloudflare/Browser use
 /**
  * Debugging Asyncify errors is tricky because the stack trace is lost when the
  * error is thrown. This code saves the stack trace in a global variable
