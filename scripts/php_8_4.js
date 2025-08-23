@@ -47,8 +47,8 @@ var EventEmitter = class EventEmitter {
 };
 // --- End EventEmitter patch ---
 var response=await fetch(url,{credentials:"same-origin"});
-if(response.ok){return response.arrayBuffer()}
-throw new Error(response.status+" : "+response.url)
+    if (response.ok) { return response.arrayBuffer(); }
+    throw new Error(response.status + " : " + response.url);
 }
 var out=Module["print"]||console.log.bind(console);
 var err=Module["printErr"]||console.error.bind(console);Object.assign(Module,moduleOverrides);moduleOverrides=null;if(Module["arguments"])arguments_=Module["arguments"];if(Module["thisProgram"])thisProgram=Module["thisProgram"];
