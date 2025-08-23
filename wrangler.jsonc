@@ -1,23 +1,16 @@
 {
   "name": "wasmphp",
+  "main": "src/index.ts",
   "compatibility_date": "2025-07-30",
   "compatibility_flags": [
     "nodejs_compat"
   ],
-  "main": "dist/worker.js",
-  "build": {
-    "command": "node esbuild.config.mjs"
-  },
   "rules": [
     {
       "type": "Data",
       "globs": [
-        "node_modules/@php-wasm/web/php/asyncify/8_4_10/php_8_4.wasm",
-        "node_modules/@php-wasm/web/shared/icudt74l.dat"
+        "scripts/php_8_4.wasm"
       ]
     }
-  ],
-  "site": {
-    "bucket": "./public"
-  }
+  ]
 }
