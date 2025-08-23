@@ -26,7 +26,7 @@ export async function init(RuntimeName, PHPLoader) {
             // 兼容 Cloudflare Worker 环境，避免 self.location 可能为 undefined
             scriptDirectory = (typeof self !== "undefined" && self.location && self.location.href) ? self.location.href : "";
         }
-        // --- EventEmitter: only browser implementation, no Node require ---
+        // --- EventEmitter patch 保留 ---
         var EventEmitter = class EventEmitter {
             constructor() { this.listeners = {}; }
             emit(eventName, data) {
@@ -53,10 +53,7 @@ export async function init(RuntimeName, PHPLoader) {
             }
         };
         // --- End EventEmitter patch ---
-        var url = dependencyFilename;
-        var response = await fetch(url, { credentials: "same-origin" });
-        if (response.ok) { return response.arrayBuffer(); }
-        throw new Error(response.status + " : " + response.url);
+        // 不 fetch，不引用 url
     }
     var out = Module["print"] || console.log.bind(console);
     var err = Module["printErr"] || console.error.bind(console);
