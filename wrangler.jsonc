@@ -2,14 +2,13 @@
   "name": "wasmphp",
   "main": "src/index.ts",
   "compatibility_date": "2025-07-30",
-  "compatibility_flags": [
-    "nodejs_compat"
-  ],
+  "compatibility_flags": ["nodejs_compat"],
   "rules": [
     {
       "type": "Data",
       "globs": [
-        "scripts/php_8_4.wasm"
+        "scripts/php_8_4.wasm",
+        "node_modules/@php-wasm/web/shared/*.dat"
       ]
     }
   ]
