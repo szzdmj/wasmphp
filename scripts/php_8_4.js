@@ -2,7 +2,7 @@ import dependencyFilename from './php_8_4.wasm';
 export { dependencyFilename }; 
 export const dependenciesTotalSize = 20087917; 
 const phpVersionString = '8.4.10';
-export function init(RuntimeName, PHPLoader) {
+export async function init(RuntimeName, PHPLoader) {
     // The rest of the code comes from the built php.js file and esm-suffix.js
 var Module=typeof PHPLoader!="undefined"?PHPLoader:{};
 var ENVIRONMENT_IS_WEB=RuntimeName==="WEB";
