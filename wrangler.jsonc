@@ -1,8 +1,11 @@
 {
   "name": "wasmphp",
-  "main": "src/index.ts",
-  "compatibility_date": "2025-07-30",
+  "main": "dist/worker.js",
+  "compatibility_date": "2025-08-23",
   "compatibility_flags": ["nodejs_compat"],
+  "build": {
+    "command": "npm run build"
+  },
   "rules": [
     {
       "type": "Data",
