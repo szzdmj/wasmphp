@@ -6,6 +6,6 @@
     "esbuild": "^0.21.5"
   },
   "scripts": {
-    "build": "echo Skip custom build; Wrangler will bundle."
+    "build": "echo Wrangler will bundle; no custom build."
   }
 }
