@@ -1,8 +1,5 @@
 {
   "name": "wasmphp",
   "main": "src/index.ts",
-  "compatibility_date": "2025-08-23",
-  "rules": [
-    { "type": "Text", "globs": ["**/*.php"], "fallthrough": false }
-  ]
+  "compatibility_date": "2025-08-23"
 }
