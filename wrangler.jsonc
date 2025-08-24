@@ -3,6 +3,13 @@
   "main": "dist/index.js",
   "compatibility_date": "2025-08-23",
   "build": { "command": "npm run build" },
+
+  // 关键：把 .wasm 作为模块绑定到 env.PHP_WASM
+  "wasm_modules": {
+    "PHP_WASM": "./scripts/php_8_4.wasm"
+  },
+
+  // 可选：消除之前的 rules 警告
   "rules": [
     { "type": "Text", "globs": ["**/*.php"], "fallthrough": false },
     { "type": "Data", "globs": ["**/*.wasm"], "fallthrough": false }
