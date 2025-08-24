@@ -1,29 +1,33 @@
-import phpWasm from "../scripts/php_8_4.wasm"; // 关键：ESM 直接 import .wasm（Wrangler 会预编译为 WebAssembly.Module）
-
-export interface Env {}
-
+// 不要在顶层 import .wasm 或 php_8_4.js，全部放到 fetch 里
 export default {
-  async fetch(request: Request, _env: Env): Promise<Response> {
+  async fetch(request: Request): Promise<Response> {
     try {
       const url = new URL(request.url);
 
-      // 诊断路由：检查导入的 wasm 是否是 WebAssembly.Module
+      // 诊断路由：动态导入 .wasm，检查类型是否为 WebAssembly.Module
       if (url.pathname === "/__diag") {
-        const ok = phpWasm && (phpWasm as any).constructor?.name === "Module";
-        return new Response(
-          JSON.stringify({ hasPHP_WASM: ok, type: (phpWasm as any)?.constructor?.name || null }),
-          { headers: { "content-type": "application/json; charset=utf-8" } }
-        );
+        try {
+          const wasmMod = await import("../scripts/php_8_4.wasm");
+          const phpWasm = (wasmMod as any).default;
+          const typeName = phpWasm?.constructor?.name || null;
+          return new Response(
+            JSON.stringify({ imported: !!phpWasm, type: typeName }),
+            { headers: { "content-type": "application/json; charset=utf-8" } }
+          );
+        } catch (e: any) {
+          return new Response(
+            JSON.stringify({ imported: false, error: e?.message || String(e) }),
+            { status: 500, headers: { "content-type": "application/json; charset=utf-8" } }
+          );
+        }
       }
 
       const isPhpRoute = url.pathname === "/" || url.pathname === "/index.php";
       if (!isPhpRoute) {
-        return new Response("PHP WASM initialized", {
-          headers: { "content-type": "text/plain; charset=utf-8" }
-        });
+        return new Response("OK", { headers: { "content-type": "text/plain; charset=utf-8" } });
       }
 
-      // 动态导入 Emscripten JS（避免顶层异常变成 1101）
+      // 1) 动态导入 Emscripten JS（任何顶层异常会被 catch 到）
       const phpModule = await import("../scripts/php_8_4.js");
       const initCandidate =
         (phpModule as any).init ||
@@ -36,6 +40,10 @@ export default {
           headers: { "content-type": "text/plain; charset=utf-8" }
         });
       }
+
+      // 2) 动态导入 .wasm（Wrangler 会把默认导出变成 WebAssembly.Module）
+      const wasmMod = await import("../scripts/php_8_4.wasm");
+      const phpWasm = (wasmMod as any).default;
 
       const stdout: string[] = [];
       const stderr: string[] = [];
@@ -50,9 +58,12 @@ export default {
         onRuntimeInitialized: () => { try { resolveReady(); } catch {} },
         onAbort: (reason: any) => { try { stderr.push("[abort] " + String(reason)); } catch {} },
 
-        // 核心：用 Wrangler 预编译好的 WebAssembly.Module 同步实例化，避免 fetch/URL/内联巨型字节
-        instantiateWasm: (imports: WebAssembly.Imports, successCallback: (instance: WebAssembly.Instance) => void) => {
-          const instance = new WebAssembly.Instance(phpWasm as unknown as WebAssembly.Module, imports);
+        // 核心：使用预编译的 WebAssembly.Module 同步实例化，避免 fetch/内联大字节
+        instantiateWasm: (
+          imports: WebAssembly.Imports,
+          successCallback: (instance: WebAssembly.Instance) => void
+        ) => {
+          const instance = new WebAssembly.Instance(phpWasm as WebAssembly.Module, imports);
           successCallback(instance);
           return instance.exports as any; // Emscripten 需要返回 exports
         },
@@ -79,6 +90,7 @@ export default {
       const status = stdout.length ? 200 : (stderr.length ? 500 : 204);
       return new Response(body, { status, headers: { "content-type": "text/html; charset=utf-8" } });
     } catch (e: any) {
+      // 把异常文本返回到响应里，便于观测（避免 1101）
       const msg = e?.stack || e?.message || String(e);
       return new Response("Runtime error: " + msg, {
         status: 500,
