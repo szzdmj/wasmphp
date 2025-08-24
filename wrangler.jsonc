@@ -1,5 +1,9 @@
 {
   "name": "wasmphp",
   "main": "src/index.ts",
-  "compatibility_date": "2025-08-23"
+  "compatibility_date": "2025-08-23",
+  // 将构建产物绑定为 Worker 环境中的 wasm 模块，避免 URL/路径问题
+  "wasm_modules": {
+    "PHP_WASM": "./scripts/php_8_4.wasm"
+  }
 }
