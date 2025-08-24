@@ -51,7 +51,7 @@ echo "[*] Stubbing PCRE2 JIT sources for WASM (pcre2_jit_*.c and sljit/*.c)..."
 STUB_COUNT=0
 # 1) Stub any pcre2_jit_*.c files
 while IFS= read -r -d '' f; do
-  if [ ! -f "${f}.upstream"} ]; then mv "$f" "${f}.upstream"; fi
+  if [ ! -f "${f}.upstream" ]; then mv "$f" "${f}.upstream"; fi
   cat > "$f" <<'EOF'
 /* WASM build: PCRE2 JIT disabled, empty translation unit */
 #define PCRE2_CODE_UNIT_WIDTH 8
@@ -260,7 +260,7 @@ COMMON_EM_FLAGS='-s EXIT_RUNTIME=0 -s ERROR_ON_UNDEFINED_SYMBOLS=0 -s WASM=1 -s 
 # Use absolute path for the forced-include header so it works in all subdirs
 SYSLOG_COMPAT_ABS="${PWD}/main/php_wasm_syslog_compat.h"
 
-# Keep our conservative CPP flags; we still tell configure we don't have setproctitle
+# Conservative CPP flags
 CPPFLAGS_IN="${EMCC_CPPFLAGS:-} -DPCRE2_CODE_UNIT_WIDTH=8 -DPCRE2_DISABLE_JIT -DSUPPORT_JIT=0 -DHAVE_PCRE_JIT=0 -DSLJIT_CONFIG_UNSUPPORTED=1 -include ${SYSLOG_COMPAT_ABS}"
 CFLAGS_IN="${EMCC_CFLAGS:- -O3}"
 LDFLAGS_IN="${EMCC_LDFLAGS:-} ${COMMON_EM_FLAGS}"
@@ -314,19 +314,57 @@ if [ ${EC} -ne 0 ]; then
   exit ${EC}
 fi
 
-echo "[*] Packaging to ${OUT_DIR}/php_8_4.js / .wasm ..."
+# Try to ensure CLI target gets linked even in cross builds
+if [ ! -f "sapi/cli/php.js" ] && [ ! -f "sapi/cli/php.wasm" ] && ! ls sapi/cli/*.bc >/dev/null 2>&1; then
+  echo "[*] CLI outputs missing after top-level make; trying to build sapi/cli/php explicitly ..."
+  set -o pipefail
+  emmake make -C sapi/cli V=1 php 2>&1 | tee -a "${OUT_DIR}/build.log"
+  EC2=${PIPESTATUS[0]}
+  set +o pipefail
+  if [ ${EC2} -ne 0 ]; then
+    echo "[-] Explicit build of sapi/cli/php failed with code ${EC2}"
+  fi
+fi
+
+echo "[*] Packaging outputs ..."
+FOUND=0
+# Case 1: direct emscripten outputs adjacent to target name
 if [ -f "sapi/cli/php.js" ] && [ -f "sapi/cli/php.wasm" ]; then
   cp -f "sapi/cli/php.js"   "${OUT_DIR}/php_8_4.js"
   cp -f "sapi/cli/php.wasm" "${OUT_DIR}/php_8_4.wasm"
-elif ls sapi/cli/*.bc >/dev/null 2>&1; then
+  FOUND=1
+fi
+
+# Case 2: bc fallback linking
+if [ ${FOUND} -eq 0 ] && ls sapi/cli/*.bc >/dev/null 2>&1; then
   BC_MAIN="$(ls sapi/cli/*.bc | head -n1)"
   echo "[*] Linking ${BC_MAIN} via emcc ..."
   emcc "${BC_MAIN}" -o "${OUT_DIR}/php_8_4.js" \
     ${CPPFLAGS_IN} ${CFLAGS_IN} ${LDFLAGS_IN} \
     -s INITIAL_MEMORY=268435456
-else
-  echo "[-] Could not find Emscripten outputs (sapi/cli/php.js or .bc). Listing sapi/cli:"
+  # emcc will also emit .wasm next to .js
+  FOUND=1
+fi
+
+# Case 3: if a bare 'sapi/cli/php' exists and emcc produced side files next to it
+if [ ${FOUND} -eq 0 ] && [ -f "sapi/cli/php" ]; then
+  if [ -f "sapi/cli/php.js" ] && [ -f "sapi/cli/php.wasm" ]; then
+    cp -f "sapi/cli/php.js"   "${OUT_DIR}/php_8_4.js"
+    cp -f "sapi/cli/php.wasm" "${OUT_DIR}/php_8_4.wasm"
+    FOUND=1
+  fi
+fi
+
+if [ ${FOUND} -eq 0 ]; then
+  echo "[-] Could not find Emscripten outputs (sapi/cli/php.js or .bc). Build tree snapshot:"
+  echo "---- Makefile CLI hints ----"
+  { grep -nE 'SAPI|CLI|php_cli' Makefile || true; } | head -n 200
+  echo "---- sapi/cli listing ----"
   ls -lah sapi/cli/ || true
+  echo "---- find sapi/cli ----"
+  find sapi/cli -maxdepth 2 -type f -ls || true
+  echo "---- tail of build.log (last 400 lines) ----"
+  tail -n 400 "${OUT_DIR}/build.log" || true
   exit 1
 fi
 
