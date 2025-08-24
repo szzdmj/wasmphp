@@ -1,15 +1,16 @@
 // 默认保持“早上的代码状态”：locateFile 使用 import.meta.url（便于复现当前错误）。
-// 仅做增量：
-// - 新增两个同源路由：/scripts/php_8_4.wasm 与 /wasm/php_8_4.wasm，均反代 GitHub raw，并带 x-worker-route 标记。
-// - 新增 /__probe：同时检查 scripts/wasm 两个同源路径与 upstream 的可达性、以及是否命中到 Worker。
-// - 新增 /health：健康检查。
-// - 调试开关（不改变默认行为）：
-//   - ?useOrigin=scripts 或 ?useOrigin=wasm 时，locateFile 对 .wasm 走对应同源路径，绕过 import.meta.url；
-//   - ?useUpstream=1 时，locateFile 对 .wasm 直接返回 GitHub raw 的绝对 URL。
+// 增量能力：
+// - /scripts/php_8_4.wasm 与 /wasm/php_8_4.wasm：反代 GitHub raw 到同源，并加 x-worker-route 标头。
+// - /__probe：检查 import.meta.url、两个同源路径、upstream，并判断是否可能触发了 Workers 的自调用保护。
+// - /health：健康检查。
+// - 调试开关（只有你显式加参数才生效，不改变默认行为）：
+//   - ?useUpstream=1   -> locateFile 对 .wasm 走 upstream（raw.githubusercontent.com）
+//   - ?useOrigin=scripts|wasm -> locateFile 对 .wasm 走同源 /scripts 或 /wasm
+//   - ?inline=1        -> 预抓 upstream 的 wasm 字节并通过 wasmBinary 传给 Emscripten，彻底避免网络加载
 
 import createPHP from '../scripts/php_8_4.js';
 
-// 如需锁定稳定版本请替换 main 为固定 commit SHA
+// 如需锁定稳定版本，建议把 main 换成固定 commit SHA
 const WASM_UPSTREAM = 'https://raw.githubusercontent.com/szzdmj/wasmphp/main/scripts/php_8_4.wasm';
 const SCRIPTS_PATH = '/scripts/php_8_4.wasm';
 const WASM_PATH = '/wasm/php_8_4.wasm';
@@ -44,7 +45,7 @@ export default {
     // 反代到同源：/scripts/php_8_4.wasm
     if (url.pathname === SCRIPTS_PATH) {
       const res = await fetch(WASM_UPSTREAM, {
-        // @ts-ignore Cloudflare 可选缓存
+        // @ts-ignore 可选：开启 CF 边缘缓存
         cf: { cacheTtl: 300, cacheEverything: true },
       });
       if (!res.ok) {
@@ -68,10 +69,10 @@ export default {
       });
     }
 
-    // 反代到同源：/wasm/php_8_4.wasm（备用路径，避免某些路径策略冲突）
+    // 反代到同源：/wasm/php_8_4.wasm（备用路径）
     if (url.pathname === WASM_PATH) {
       const res = await fetch(WASM_UPSTREAM, {
-        // @ts-ignore Cloudflare 可选缓存
+        // @ts-ignore 可选：开启 CF 边缘缓存
         cf: { cacheTtl: 300, cacheEverything: true },
       });
       if (!res.ok) {
@@ -95,8 +96,9 @@ export default {
       });
     }
 
-    // 探针：检查 import.meta.url、两个同源路径是否命中 Worker、各自的抓取状态，以及 upstream 状态
+    // 探针
     if (url.pathname === '/__probe') {
+      // import.meta.url 可用性
       let importMetaUrl: string | null = null;
       try {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -105,7 +107,7 @@ export default {
         importMetaUrl = null;
       }
 
-      // 基于 import.meta.url 的候选（若不可用则为 null）
+      // 基于 import.meta.url 的候选
       let wasmURL_from_importMeta: string | null = null;
       if (importMetaUrl) {
         try {
@@ -128,6 +130,14 @@ export default {
       const routeHitScripts = checkScripts.headers['x-worker-route'] === 'scripts';
       const routeHitWasm = checkWasm.headers['x-worker-route'] === 'wasm';
 
+      // 在 Workers 中自调用同一 workers.dev 服务常见会被保护，呈现 404。根据现象给出提示标记。
+      const selfFetchLikelyBlocked =
+        !routeHitScripts &&
+        !routeHitWasm &&
+        checkScripts.status === 404 &&
+        checkWasm.status === 404 &&
+        fromUpstream.ok;
+
       const payload = {
         importMetaUrlPresent: typeof importMetaUrl === 'string',
         importMetaUrl,
@@ -136,6 +146,7 @@ export default {
         wasmURL,
         routeHitScripts,
         routeHitWasm,
+        selfFetchLikelyBlocked,
         fetch_scripts: checkScripts,
         fetch_wasm: checkWasm,
         fetch_from_importMeta: fromImportMeta,
@@ -152,8 +163,26 @@ export default {
     try {
       const useOrigin = url.searchParams.get('useOrigin'); // 'scripts' | 'wasm' | null
       const useUpstream = url.searchParams.get('useUpstream') === '1';
+      const inline = url.searchParams.get('inline') === '1';
+
+      // inline=1: 直接抓取 upstream 的 WASM 并以 wasmBinary 传入，彻底避免网络加载环节
+      let wasmBinary: Uint8Array | undefined;
+      if (inline) {
+        const upstreamRes = await fetch(WASM_UPSTREAM, {
+          // @ts-ignore 可选：缓存
+          cf: { cacheTtl: 300, cacheEverything: true },
+        });
+        if (!upstreamRes.ok) {
+          return new Response(`Prefetch upstream wasm failed: ${upstreamRes.status}`, { status: 502 });
+        }
+        const buf = await upstreamRes.arrayBuffer();
+        wasmBinary = new Uint8Array(buf);
+      }
 
       const php = await createPHP({
+        // Emscripten 会优先使用 wasmBinary；若提供了则不会再去拉取 .wasm
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        ...(wasmBinary ? ({ wasmBinary } as any) : {}),
         locateFile: (p: string) => {
           if (p.endsWith('.wasm')) {
             if (useUpstream) return WASM_UPSTREAM;
