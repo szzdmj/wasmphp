@@ -6,7 +6,7 @@ build({
   outfile: "dist/worker.js",
   platform: "browser",
   target: "esnext",
-  loader: { ".dat": "file", ".wasm": "file" },
+  loader: { ".dat": "file", ".wasm": "file", ".php": "text" },
   external: [
     "@php-wasm/web/php/asyncify/8_4_10/php_8_4.js",
     "@php-wasm/web/php/asyncify/8_4_10/php_8_4.wasm",
