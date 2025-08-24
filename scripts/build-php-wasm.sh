@@ -48,7 +48,6 @@ EOF
 done < <(find ext -type f -path '*/sljit/*.c' -print0 2>/dev/null)
 
 # Pre-patch 2: stub ext/standard/dns.c to avoid dns_* API on Emscripten.
-# This file pulls in dns_open/dns_search/dns_free/dns_handle_t which do not exist on musl/Emscripten.
 DNS_C="ext/standard/dns.c"
 if [ -f "${DNS_C}" ]; then
   if [ ! -f "${DNS_C}.upstream" ]; then
@@ -64,6 +63,30 @@ EOF
   STUB_COUNT=$((STUB_COUNT+1))
 fi
 
+# Pre-patch 3: stub main/php_syslog.c to avoid std_syslog/syslog on Emscripten.
+SYSLOG_C="main/php_syslog.c"
+if [ -f "${SYSLOG_C}" ]; then
+  if [ ! -f "${SYSLOG_C}.upstream" ]; then
+    mv "${SYSLOG_C}" "${SYSLOG_C}.upstream"
+    echo "  - backing up ${SYSLOG_C} -> ${SYSLOG_C}.upstream"
+  fi
+  cat > "${SYSLOG_C}" <<'EOF'
+/* WASM build: disable syslog usage (empty translation unit implementing php_syslog).
+   Emscripten/musl lacks usable syslog in the target environment. */
+#include "php.h"
+#include "php_syslog.h"
+#include <stdarg.h>
+PHPAPI void php_syslog(int priority, const char *format, ...) {
+  (void)priority; (void)format;
+  va_list ap;
+  va_start(ap, format);
+  va_end(ap);
+}
+EOF
+  echo "  - stubbed: ${SYSLOG_C}"
+  STUB_COUNT=$((STUB_COUNT+1))
+fi
+
 echo "[*] Total stubbed files: ${STUB_COUNT}"
 
 # Cross triples
@@ -71,19 +94,20 @@ HOST_TRIPLE="wasm32-unknown-emscripten"
 BUILD_TRIPLE="$(/bin/sh build/config.guess || echo x86_64-pc-linux-gnu)"
 
 # Build flags
-# - Disable PCRE2 JIT in multiple ways (configure + macros)
-# - Single-thread, ES6 module, Worker, allow memory growth, FS on
 COMMON_EM_FLAGS='-s EXIT_RUNTIME=0 -s ERROR_ON_UNDEFINED_SYMBOLS=0 -s WASM=1 -s MODULARIZE=1 -s EXPORT_ES6=1 -s ENVIRONMENT=worker -s ALLOW_MEMORY_GROWTH=1 -s FILESYSTEM=1'
 CPPFLAGS_IN="${EMCC_CPPFLAGS:-} -DPCRE2_CODE_UNIT_WIDTH=8 -DPCRE2_DISABLE_JIT -DSUPPORT_JIT=0 -DHAVE_PCRE_JIT=0 -DSLJIT_CONFIG_UNSUPPORTED=1"
 CFLAGS_IN="${EMCC_CFLAGS:- -O3}"
 LDFLAGS_IN="${EMCC_LDFLAGS:-} ${COMMON_EM_FLAGS}"
 
-# Hint autoconf to avoid selecting dns_* / res_n* path
+# Hint autoconf to avoid selecting syslog and dns paths
 export ac_cv_func_dns_search=no
 export ac_cv_func_dns_open=no
 export ac_cv_func_dns_free=no
 export ac_cv_func_res_nsearch=no
 export ac_cv_func_res_ndestroy=no
+export ac_cv_header_syslog_h=no
+export ac_cv_func_syslog=no
+export ac_cv_func_vsyslog=no
 
 echo "[*] emconfigure ./configure ..."
 set +e
