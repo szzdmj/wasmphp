@@ -1,9 +1,12 @@
-// 关键修正：不再通过静态 import 加载 Emscripten 产物（其内部用到了 import.meta.url）。
-// 改为：从 GitHub raw 拉取 scripts/php_8_4.js 源码，内存中将 import.meta.url 安全替换，再用 new Function 评估导出工厂。
-// 其余：保留 /scripts 与 /wasm 反代路由、/__probe 探针、?useUpstream=1 与 ?inline=1 调试开关。
+// 关键修正：使用静态 import 加载预处理的 Emscripten 产物，避免动态代码评估。
+// scripts/php_8_4_cf.js 已经移除 import.meta.url 使用，并配置为可在 Cloudflare Workers 运行。
+// 默认模式：内联加载 WASM (wasmBinary)，避免实例化时的网络请求。
+// 其余：保留 /scripts 与 /wasm 反代路由、/__probe 探针、以及各种调试开关。
+
+// @ts-ignore - JavaScript module without types
+import createPHP from '../scripts/php_8_4_cf.js';
 
 // 如需锁定稳定版本，建议将 main 换为固定 commit SHA
-const JS_UPSTREAM = 'https://raw.githubusercontent.com/szzdmj/wasmphp/main/scripts/php_8_4.js';
 const WASM_UPSTREAM = 'https://raw.githubusercontent.com/szzdmj/wasmphp/main/scripts/php_8_4.wasm';
 
 const SCRIPTS_PATH = '/scripts/php_8_4.wasm';
@@ -25,45 +28,6 @@ async function fetchInfo(urlStr: string): Promise<FetchInfo> {
   } catch (e: any) {
     return { ok: false, status: -1, headers: {}, error: e?.stack || String(e) };
   }
-}
-
-// 动态加载并“打补丁”的 Emscripten 工厂：移除 import/export 语法并屏蔽 import.meta.url 的使用
-async function loadCreatePHP(): Promise<(opts: any) => Promise<any>> {
-  const res = await fetch(JS_UPSTREAM, {
-    // @ts-ignore 可选缓存
-    cf: { cacheTtl: 300, cacheEverything: true },
-  });
-  if (!res.ok) {
-    throw new Error(`Fetch JS upstream failed: ${res.status}`);
-  }
-  let code = await res.text();
-
-  // 1) 屏蔽 import.meta.url 的使用（避免在 Workers 中为 undefined 时进入 new URL(...).href 逻辑）
-  // 粗暴但有效：把所有 import.meta.url 替换为 undefined（Emscripten 有多环境分支，后续会走其它路径）
-  code = code.replaceAll('import.meta.url', 'undefined');
-
-  // 2) 去掉 ESM 导出语法，改为挂到全局，供后续读取
-  code = code.replace('export default Module;', 'globalThis.__PHP_FACTORY__ = Module;');
-
-  // 3) 在受控作用域执行（Cloudflare Workers 允许 new Function）
-  // 提供极少的环境变量以避免 Node 分支误判
-  const wrapper = `
-    (function () {
-      var module = undefined;
-      var require = undefined;
-      var window = undefined;
-      var document = undefined;
-      ${code}
-    })();
-  `;
-  // eslint-disable-next-line no-new-func
-  new Function(wrapper)();
-
-  const factory = (globalThis as any).__PHP_FACTORY__;
-  if (typeof factory !== 'function') {
-    throw new Error('Patched PHP factory not found on globalThis');
-  }
-  return factory;
 }
 
 export default {
@@ -178,9 +142,9 @@ export default {
     try {
       const useOrigin = url.searchParams.get('useOrigin'); // 'scripts' | 'wasm' | null
       const useUpstream = url.searchParams.get('useUpstream') === '1';
-      const inline = url.searchParams.get('inline') === '1';
+      const inline = url.searchParams.get('inline') !== '0'; // DEFAULT: inline mode, opt-out with ?inline=0
 
-      // inline=1: 预抓 upstream 的 WASM 并以 wasmBinary 传给 Emscripten，彻底避免网络加载
+      // 默认内联模式：预抓 upstream 的 WASM 并以 wasmBinary 传给 Emscripten，彻底避免网络加载
       let wasmBinary: Uint8Array | undefined;
       if (inline) {
         const upstreamRes = await fetch(WASM_UPSTREAM, {
@@ -194,9 +158,7 @@ export default {
         wasmBinary = new Uint8Array(buf);
       }
 
-      // 动态加载已“打补丁”的 Emscripten 工厂
-      const createPHP = await loadCreatePHP();
-
+      // 使用静态导入的预处理 Emscripten 工厂
       const php = await createPHP({
         // 若提供 wasmBinary，Emscripten 将不会再发起网络请求加载 .wasm
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -207,8 +169,8 @@ export default {
             if (useUpstream) return WASM_UPSTREAM;
             if (useOrigin === 'wasm') return `${url.origin}/wasm/${p}`;
             if (useOrigin === 'scripts') return `${url.origin}/scripts/${p}`;
-            // 默认指向同源 scripts（外部访问可用；内部自调用会 404，可用开关或 inline/Upstream 绕过）
-            return `${url.origin}/scripts/${p}`;
+            // 默认指向 upstream（外部测试可用；在内联模式下此路径不会被调用）
+            return WASM_UPSTREAM;
           }
           return p;
         },
