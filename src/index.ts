@@ -1,3 +1,5 @@
+import wasmBinary from "../scripts/php_8_4.wasm";
+
 export default {
   async fetch(request: Request): Promise<Response> {
     try {
@@ -9,17 +11,14 @@ export default {
         });
       }
 
-      // 动态导入，避免顶层初始化异常导致 1101
-      const [{ default: wasmBinary }, phpModule] = await Promise.all([
-        import("../scripts/php_8_4.wasm"),
-        import("../scripts/php_8_4.js"),
-      ]);
+      // 仅动态导入 JS 模块，避免对巨大的 WASM 二进制做 __toESM 包装导致枚举属性
+      const phpModule = await import("../scripts/php_8_4.js");
 
-      // 获取 init 函数（兼容不同导出方式）
+      // 兼容不同导出方式，优先取 init，其次 default，其次模块本身
       const initCandidate =
         (phpModule as any).init ||
         (phpModule as any).default ||
-        phpModule;
+        (phpModule as any);
 
       if (typeof initCandidate !== "function") {
         return new Response("Runtime error: PHP init function not found on module export", {
@@ -43,7 +42,7 @@ export default {
         onRuntimeInitialized: () => { try { resolveReady(); } catch {} },
       };
 
-      // 尝试两种 init 签名
+      // 尝试两种 init 签名：单参与带 "WORKER"
       let php: any;
       try {
         php = await (initCandidate as any)(moduleOptions);
@@ -54,7 +53,7 @@ export default {
       // 确保运行时完全就绪
       await runtimeReady;
 
-      // 仅执行内联 phpinfo()，完全绕过 FS
+      // 完全绕过 FS，仅执行内联 phpinfo()
       try {
         php.callMain(["-r", "phpinfo();"]);
       } catch (e: any) {
@@ -70,7 +69,6 @@ export default {
       });
     } catch (e: any) {
       const msg = e?.stack || e?.message || String(e);
-      // 将所有异常包装为 500 返回，避免 1101（未捕获异常）
       return new Response("Runtime error: " + msg, {
         status: 500,
         headers: { "content-type": "text/plain; charset=utf-8" },
