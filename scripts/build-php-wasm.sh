@@ -4,22 +4,49 @@ set -euo pipefail
 # Directories
 ROOT="$(pwd)"
 OUT_DIR="${ROOT}/scripts"
-PHP_DIR="${ROOT}/vendor/php-src"
+SRC_PARENT="${ROOT}/vendor"
+PHP_DIR="${SRC_PARENT}/php-src"
 
-mkdir -p "${OUT_DIR}" "${ROOT}/vendor"
+mkdir -p "${OUT_DIR}" "${SRC_PARENT}"
 
 # PHP ref can be overridden: PHP_REF=php-8.4.0 or master
 PHP_REF="${PHP_REF:-php-8.4.0}"
 
+# Decide source: tarball for official releases (php-X.Y.Z), git otherwise
+use_tarball=0
+if [[ "${PHP_REF}" =~ ^php-[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  use_tarball=1
+fi
+
 if [ ! -d "${PHP_DIR}" ]; then
-  echo "[*] Cloning PHP src (${PHP_REF})..."
-  git clone --depth=1 --branch "${PHP_REF}" https://github.com/php/php-src.git "${PHP_DIR}"
+  if [ "${use_tarball}" -eq 1 ]; then
+    echo "[*] Downloading PHP release tarball ${PHP_REF}..."
+    TARBALL_URL="https://www.php.net/distributions/${PHP_REF}.tar.gz"
+    TARBALL="${SRC_PARENT}/${PHP_REF}.tar.gz"
+    curl -fsSL "${TARBALL_URL}" -o "${TARBALL}"
+    echo "[*] Extracting tarball..."
+    tar -xzf "${TARBALL}" -C "${SRC_PARENT}"
+    # The tarball extracts to php-X.Y.Z, move/rename to php-src
+    EXTRACT_DIR="${SRC_PARENT}/${PHP_REF/php-/php-}"
+    if [ ! -d "${EXTRACT_DIR}" ]; then
+      # Fallback: try without 'php-' prefix mismatch
+      EXTRACT_DIR_GLOB="$(echo ${SRC_PARENT}/php-*/)"
+      EXTRACT_DIR="${EXTRACT_DIR_GLOB%/}"
+    fi
+    mv "${EXTRACT_DIR}" "${PHP_DIR}"
+  else
+    echo "[*] Cloning PHP src (${PHP_REF})..."
+    git clone --depth=1 --branch "${PHP_REF}" https://github.com/php/php-src.git "${PHP_DIR}"
+  fi
 fi
 
 cd "${PHP_DIR}"
 
-echo "[*] Running buildconf..."
-./buildconf --force
+# Only needed for git checkouts; tarballs already have generated files
+if [ "${use_tarball}" -eq 0 ]; then
+  echo "[*] Running buildconf..."
+  ./buildconf --force
+fi
 
 # Pre-patch 1: hard-disable PCRE2 JIT by stubbing all JIT and sljit sources.
 echo "[*] Stubbing PCRE2 JIT sources for WASM (pcre2_jit_*.c and sljit/*.c)..."
@@ -88,7 +115,6 @@ EOF
 fi
 
 # Pre-patch 4: add a compatibility header to provide LOG_* constants
-# and force-include it during compilation (so basic_functions can register constants).
 COMPAT_HDR="main/php_wasm_syslog_compat.h"
 cat > "${COMPAT_HDR}" <<'EOF'
 #ifndef PHP_WASM_SYSLOG_COMPAT_H
@@ -256,12 +282,12 @@ EC=${PIPESTATUS[0]}
 set +o pipefail
 if [ ${EC} -ne 0 ]; then
   echo "[-] Build failed. Showing relevant compiler errors from build.log:"
-  awk '
-    /\/emsdk\/upstream\/emscripten\/em(cc|\+\+)/ { incc=1; print; next }
-    incc && /error:/ { print; shown+=1; if (shown>=50) exit }
-  ' "${OUT_DIR}/build.log" || true
-  echo "---- tail of build.log (last 400 lines) ----"
-  tail -n 400 "${OUT_DIR}/build.log" || true
+  # Try to surface the real cause: compiler errors or missing generators
+  { 
+    grep -nE "(/emscripten/em(cc|\+\+)| error: |: error:|No such file or directory|command not found|bison|re2c)" "${OUT_DIR}/build.log" | tail -n 200;
+    echo "---- tail of build.log (last 400 lines) ----";
+    tail -n 400 "${OUT_DIR}/build.log";
+  } || true
   exit ${EC}
 fi
 
