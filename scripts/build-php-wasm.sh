@@ -21,7 +21,7 @@ cd "${PHP_DIR}"
 echo "[*] Running buildconf..."
 ./buildconf --force
 
-# Pre-patch: hard-disable PCRE2 JIT by stubbing all JIT and sljit sources.
+# Pre-patch 1: hard-disable PCRE2 JIT by stubbing all JIT and sljit sources.
 echo "[*] Stubbing PCRE2 JIT sources for WASM (pcre2_jit_*.c and sljit/*.c)..."
 STUB_COUNT=0
 # 1) Stub any pcre2_jit_*.c files
@@ -47,6 +47,23 @@ EOF
   STUB_COUNT=$((STUB_COUNT+1))
 done < <(find ext -type f -path '*/sljit/*.c' -print0 2>/dev/null)
 
+# Pre-patch 2: stub ext/standard/dns.c to avoid dns_* API on Emscripten.
+# This file pulls in dns_open/dns_search/dns_free/dns_handle_t which do not exist on musl/Emscripten.
+DNS_C="ext/standard/dns.c"
+if [ -f "${DNS_C}" ]; then
+  if [ ! -f "${DNS_C}.upstream" ]; then
+    mv "${DNS_C}" "${DNS_C}.upstream"
+    echo "  - backing up ${DNS_C} -> ${DNS_C}.upstream"
+  fi
+  cat > "${DNS_C}" <<'EOF'
+/* WASM build: disable ext/standard DNS implementation (empty translation unit).
+   Emscripten/musl lacks dns_* API used by php_dns macros. */
+void __php_wasm_dns_stub(void) {}
+EOF
+  echo "  - stubbed: ${DNS_C}"
+  STUB_COUNT=$((STUB_COUNT+1))
+fi
+
 echo "[*] Total stubbed files: ${STUB_COUNT}"
 
 # Cross triples
@@ -60,6 +77,13 @@ COMMON_EM_FLAGS='-s EXIT_RUNTIME=0 -s ERROR_ON_UNDEFINED_SYMBOLS=0 -s WASM=1 -s 
 CPPFLAGS_IN="${EMCC_CPPFLAGS:-} -DPCRE2_CODE_UNIT_WIDTH=8 -DPCRE2_DISABLE_JIT -DSUPPORT_JIT=0 -DHAVE_PCRE_JIT=0 -DSLJIT_CONFIG_UNSUPPORTED=1"
 CFLAGS_IN="${EMCC_CFLAGS:- -O3}"
 LDFLAGS_IN="${EMCC_LDFLAGS:-} ${COMMON_EM_FLAGS}"
+
+# Hint autoconf to avoid selecting dns_* / res_n* path
+export ac_cv_func_dns_search=no
+export ac_cv_func_dns_open=no
+export ac_cv_func_dns_free=no
+export ac_cv_func_res_nsearch=no
+export ac_cv_func_res_ndestroy=no
 
 echo "[*] emconfigure ./configure ..."
 set +e
@@ -91,7 +115,6 @@ EC=${PIPESTATUS[0]}
 set +o pipefail
 if [ ${EC} -ne 0 ]; then
   echo "[-] Build failed. Showing relevant compiler errors from build.log:"
-  # Show only lines near emcc/em++ that contain 'error:'
   awk '
     /\/emsdk\/upstream\/emscripten\/em(cc|\+\+)/ { incc=1; print; next }
     incc && /error:/ { print; shown+=1; if (shown>=50) exit }
