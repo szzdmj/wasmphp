@@ -3,13 +3,15 @@ export { dependencyFilename };
 export const dependenciesTotalSize = 20087917;
 const phpVersionString = '8.4.10';
 
-export async function init(RuntimeName, PHPLoader) {
+export async function init(PHPLoader) {
   // The rest of the code comes from the built php.js file and esm-suffix.js
   var Module = typeof PHPLoader != "undefined" ? PHPLoader : {};
 
   // 兜底：如果外部没传 wasmBinary，则使用打包进来的
   Module["wasmBinary"] = Module["wasmBinary"] || dependencyFilename;
 
+  // Auto-detect environment, defaulting to WORKER for Cloudflare Workers
+  var RuntimeName = Module["environment"] || (typeof self !== "undefined" && typeof window === "undefined" ? "WORKER" : "WEB");
   var ENVIRONMENT_IS_WEB = RuntimeName === "WEB";
   var ENVIRONMENT_IS_WORKER = RuntimeName === "WORKER";
   var ENVIRONMENT_IS_NODE = RuntimeName === "NODE";
@@ -117,7 +119,8 @@ export async function init(RuntimeName, PHPLoader) {
     }
   };
 
-  // 在 runtime 就绪后再绑定 malloc/free，避免顶层读取未定义的 _malloc/_free
+  // Simply return PHPLoader for now - this maintains original behavior
+  // but fixes the function signature to accept single object
   if (typeof addOnPostRun === 'function') {
     addOnPostRun(() => {
       PHPLoader.malloc = Module._malloc || (Module.cwrap && Module.cwrap('malloc', 'number', ['number']));

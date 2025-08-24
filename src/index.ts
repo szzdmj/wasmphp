@@ -18,12 +18,17 @@ export default {
     const stderr: string[] = [];
 
     try {
-      // Initialize PHP for this request so we can capture output deterministically
-      const php = await initPHP("WORKER", {
+      // FIX: pass only a single options object to the Emscripten module factory
+      const php: any = await initPHP({
         wasmBinary,
         print: (txt: string) => stdout.push(String(txt)),
         printErr: (txt: string) => stderr.push(String(txt)),
+        noInitialRun: true,
       });
+
+      if (!php?.FS || typeof php.FS.writeFile !== "function") {
+        throw new Error("Emscripten FS not available on module after initPHP()");
+      }
 
       // Prepare VFS and write /public/index.php
       try { php.FS.mkdir("/public"); } catch {}
