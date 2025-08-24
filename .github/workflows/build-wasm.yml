@@ -1,11 +1,97 @@
-- name: Build PHP Wasm (single-thread)
-  env:
-    PHP_REF: "php-8.4.0"
-    JOBS: "2"
-  run: |
-    docker run --rm \
-      -v "${GITHUB_WORKSPACE}:/work" \
-      -e MAKEFLAGS="-j${JOBS}" \
-      -e PHP_REF="${PHP_REF}" \
-      -e JOBS="${JOBS}" \
-      php-wasm:single /bin/bash -lc "cd /work && bash ./scripts/build-php-wasm.sh"
+name: Build PHP Wasm (single-thread) for Cloudflare Workers
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+    paths:
+      - "docker/Dockerfile.php-wasm"
+      - "scripts/build-php-wasm.sh"
+      - ".github/workflows/build-wasm.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure LF line endings and executable bit
+        shell: bash
+        run: |
+          sed -i 's/\r$//' scripts/build-php-wasm.sh
+          chmod +x scripts/build-php-wasm.sh
+
+      - name: Build docker image (emscripten+deps)
+        run: docker build -f docker/Dockerfile.php-wasm -t php-wasm:single .
+
+      - name: Build PHP Wasm (single-thread) with full logs
+        id: build
+        shell: bash
+        run: |
+          set -o pipefail
+          # 低并发便于查看日志；需要可以上调 JOBS
+          export PHP_REF="php-8.4.0"
+          export JOBS="1"
+          # 运行构建并把输出保存到 build.log（在工作区）
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/work" \
+            -e MAKEFLAGS="-j${JOBS}" \
+            -e PHP_REF="${PHP_REF}" \
+            -e JOBS="${JOBS}" \
+            php-wasm:single /bin/bash -lc "cd /work && bash ./scripts/build-php-wasm.sh" |& tee build.log
+          ec=${PIPESTATUS[0]}
+          echo "exitcode=${ec}" >> $GITHUB_OUTPUT
+          # 不在这里失败，让后续步骤打印/上传日志
+          exit 0
+
+      - name: Show tails of logs (always)
+        if: always()
+        shell: bash
+        run: |
+          echo "---- tail build.log ----"
+          tail -n 300 build.log || true
+          if [ -f vendor/php-src/config.log ]; then
+            echo "---- tail vendor/php-src/config.log ----"
+            tail -n 300 vendor/php-src/config.log || true
+          else
+            echo "config.log not found at vendor/php-src/config.log"
+          fi
+
+      - name: Upload logs and outputs (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: php84-build-artifacts
+          path: |
+            build.log
+            vendor/php-src/config.log
+            vendor/php-src/sapi/cli/**
+
+      - name: List outputs
+        if: always()
+        run: ls -lah scripts/ || true
+
+      - name: Upload wasm artifacts (on success)
+        if: ${{ steps.build.outputs.exitcode == '0' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: php84-wasm-singlethread
+          path: |
+            scripts/php_8_4.js
+            scripts/php_8_4.wasm
+
+      - name: Auto-commit built artifacts (optional, on success)
+        if: ${{ steps.build.outputs.exitcode == '0' }}
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: build single-thread php_8_4 wasm artifacts"
+          file_pattern: scripts/php_8_4.js scripts/php_8_4.wasm
+          push_options: --force-with-lease
+          skip_dirty_check: false
+
+      - name: Fail job if build failed
+        if: ${{ steps.build.outputs.exitcode != '0' }}
+        run: exit 1
