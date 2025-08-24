@@ -13,7 +13,7 @@ export async function init(PHPLoader) {
   // Auto-detect environment, defaulting to WORKER for Cloudflare Workers
   var RuntimeName = Module["environment"] || (typeof self !== "undefined" && typeof window === "undefined" ? "WORKER" : "WEB");
   var ENVIRONMENT_IS_WEB = RuntimeName === "WEB";
-  var ENVIRONMENT_IS_WORKER = RuntimeName === "WORKER";
+  var ENVIRONMENT_IS_WORKER = RuntimeName === "WORKER";  
   var ENVIRONMENT_IS_NODE = RuntimeName === "NODE";
   var moduleOverrides = {};
   var key, value;
@@ -119,8 +119,8 @@ export async function init(PHPLoader) {
     }
   };
 
-  // Simply return PHPLoader for now - this maintains original behavior
-  // but fixes the function signature to accept single object
+  // For the single-object calling pattern, just return the Module
+  // The initialization should be handle by the underlying Emscripten runtime
   if (typeof addOnPostRun === 'function') {
     addOnPostRun(() => {
       PHPLoader.malloc = Module._malloc || (Module.cwrap && Module.cwrap('malloc', 'number', ['number']));
