@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --format=esm --target=esnext --outdir=dist --loader:.php=text"
+    "build": "esbuild src/index.ts --bundle --format=esm --target=esnext --outdir=dist --loader:.php=text --loader:.wasm=file"
   },
   "devDependencies": {
     "esbuild": "^0.21.5"
