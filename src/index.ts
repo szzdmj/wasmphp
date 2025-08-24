@@ -1,4 +1,4 @@
-import wasmBinary from "../scripts/php_8_4.wasm";
+import wasmUrl from "../scripts/php_8_4.wasm";
 
 export default {
   async fetch(request: Request): Promise<Response> {
@@ -11,10 +11,10 @@ export default {
         });
       }
 
-      // 仅动态导入 JS 模块，避免对巨大的 WASM 二进制做 __toESM 包装导致枚举属性
+      // 动态导入 JS 模块，任何顶层异常都会通过 Promise 拒绝被 try/catch 捕获
       const phpModule = await import("../scripts/php_8_4.js");
 
-      // 兼容不同导出方式，优先取 init，其次 default，其次模块本身
+      // 兼容不同导出方式
       const initCandidate =
         (phpModule as any).init ||
         (phpModule as any).default ||
@@ -35,14 +35,15 @@ export default {
       const runtimeReady = new Promise<void>((res) => { resolveReady = res; });
 
       const moduleOptions: any = {
-        wasmBinary,
         noInitialRun: true,
         print: (txt: string) => { try { stdout.push(String(txt)); } catch {} },
         printErr: (txt: string) => { try { stderr.push(String(txt)); } catch {} },
         onRuntimeInitialized: () => { try { resolveReady(); } catch {} },
+        // 关键：让 Emscripten 用 URL 自行加载 wasm，避免把巨大字节内联到模块里
+        locateFile: (_path: string) => wasmUrl,
       };
 
-      // 尝试两种 init 签名：单参与带 "WORKER"
+      // 尝试两种 init 签名
       let php: any;
       try {
         php = await (initCandidate as any)(moduleOptions);
@@ -50,10 +51,9 @@ export default {
         php = await (initCandidate as any)("WORKER", moduleOptions);
       }
 
-      // 确保运行时完全就绪
       await runtimeReady;
 
-      // 完全绕过 FS，仅执行内联 phpinfo()
+      // 仅执行内联 phpinfo()，完全绕过 FS
       try {
         php.callMain(["-r", "phpinfo();"]);
       } catch (e: any) {
