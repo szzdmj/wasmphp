@@ -1,69 +1,11 @@
-name: Build PHP Wasm (single-thread) for Cloudflare Workers
-
-on:
-  workflow_dispatch:
-  push:
-    branches: [ main, master ]
-    paths:
-      - "docker/Dockerfile.php-wasm"
-      - "scripts/build-php-wasm.sh"
-      - ".github/workflows/build-wasm.yml"
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Ensure LF line endings and executable bit
-        shell: bash
-        run: |
-          sed -i 's/\r$//' scripts/build-php-wasm.sh
-          chmod +x scripts/build-php-wasm.sh
-
-      - name: Build docker image (emscripten+deps)
-        run: docker build -f docker/Dockerfile.php-wasm -t php-wasm:single .
-
-      - name: Build PHP Wasm (single-thread)
-        id: build
-        continue-on-error: true
-        run: |
-          docker run --name phpwasm --rm \
-            -v "${GITHUB_WORKSPACE}:/work" \
-            -e MAKEFLAGS="-j$(nproc)" \
-            -e PHP_REF="php-8.4.0" \
-            php-wasm:single /bin/bash -lc "cd /work && bash ./scripts/build-php-wasm.sh"
-
-      - name: Dump config.log on failure
-        if: steps.build.outcome == 'failure'
-        run: |
-          echo "Attempting to copy config.log out of container (if any)..."
-          # 容器已 --rm，不存在文件；脚本已在失败时 tail config.log。这里作为兜底输出目录结构。
-          ls -lah vendor/php-src || true
-          ls -lah vendor/php-src/sapi/cli || true
-          exit 1
-
-      - name: List outputs
-        if: steps.build.outcome == 'success'
-        run: ls -lah scripts/ || true
-
-      - name: Upload artifacts
-        if: steps.build.outcome == 'success'
-        uses: actions/upload-artifact@v4
-        with:
-          name: php84-wasm-singlethread
-          path: |
-            scripts/php_8_4.js
-            scripts/php_8_4.wasm
-
-      - name: Auto-commit built artifacts (optional)
-        if: steps.build.outcome == 'success'
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "chore: build single-thread php_8_4 wasm artifacts"
-          file_pattern: scripts/php_8_4.js scripts/php_8_4.wasm
-          push_options: --force-with-lease
-          skip_dirty_check: false
+- name: Build PHP Wasm (single-thread)
+  env:
+    PHP_REF: "php-8.4.0"
+    JOBS: "2"
+  run: |
+    docker run --rm \
+      -v "${GITHUB_WORKSPACE}:/work" \
+      -e MAKEFLAGS="-j${JOBS}" \
+      -e PHP_REF="${PHP_REF}" \
+      -e JOBS="${JOBS}" \
+      php-wasm:single /bin/bash -lc "cd /work && bash ./scripts/build-php-wasm.sh"
