@@ -2,7 +2,7 @@
   "name": "wasmphp",
   "version": "1.0.0",
   "type": "module",
-  "main": "dist/worker.js",
+  "main": "dist/index.js",
   "scripts": {
     "build": "esbuild src/index.ts --bundle --format=esm --target=esnext --outdir=dist --loader:.wasm=binary",
     "deploy": "wrangler deploy",
