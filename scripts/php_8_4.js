@@ -100,7 +100,7 @@ export async function init(RuntimeName, PHPLoader) {
     var runtimeInitialized = false;
     var runtimeExited = false;
     function callRuntimeCallbacks(callbacks) { while (callbacks.length > 0) { callbacks.shift()(Module) } }
-    ExitStatus = class PHPExitStatus extends Error {
+    var ExitStatus = class PHPExitStatus extends Error {
         constructor(status) {
             super(status);
             this.name = 'ExitStatus';
