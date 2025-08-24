@@ -2,10 +2,10 @@
   "name": "wasmphp",
   "version": "1.0.0",
   "private": true,
-  "scripts": {
-    "build": "esbuild src/index.ts --bundle --format=esm --target=esnext --outdir=dist --loader:.php=text --loader:.wasm=file"
-  },
   "devDependencies": {
     "esbuild": "^0.21.5"
+  },
+  "scripts": {
+    "build": "echo Skip custom build; Wrangler will bundle."
   }
 }
