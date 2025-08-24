@@ -1,0 +1,49 @@
+name: Build PHP Wasm (single-thread) for Cloudflare Workers
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+    paths:
+      - "docker/Dockerfile.php-wasm"
+      - "scripts/build-php-wasm.sh"
+      - ".github/workflows/build-wasm.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build docker image (emscripten+deps)
+        run: |
+          docker build -f docker/Dockerfile.php-wasm -t php-wasm:single .
+
+      - name: Build PHP Wasm (single-thread)
+        run: |
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/work" \
+            -e MAKEFLAGS="-j$(nproc)" \
+            php-wasm:single /bin/bash -lc "cd /work && ./scripts/build-php-wasm.sh"
+
+      - name: List outputs
+        run: ls -lah scripts/ || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: php84-wasm-singlethread
+          path: |
+            scripts/php_8_4.js
+            scripts/php_8_4.wasm
+
+      - name: Auto-commit built artifacts (optional)
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: build single-thread php_8_4 wasm artifacts"
+          file_pattern: scripts/php_8_4.js scripts/php_8_4.wasm
+          push_options: --force-with-lease
+          skip_dirty_check: false
