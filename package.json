@@ -3,9 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --format=esm --target=esnext --outdir=dist --loader:.wasm=file --loader:.php=text"
+    "build": "esbuild src/index.ts --bundle --format=esm --target=esnext --outdir=dist --loader:.wasm=binary --loader:.php=text"
   },
   "devDependencies": {
-    "esbuild": "^0.21.0"
+    "esbuild": "^0.21.5"
   }
 }
