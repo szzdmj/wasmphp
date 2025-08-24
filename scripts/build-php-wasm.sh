@@ -26,10 +26,8 @@ if [ ! -d "${PHP_DIR}" ]; then
     curl -fsSL "${TARBALL_URL}" -o "${TARBALL}"
     echo "[*] Extracting tarball..."
     tar -xzf "${TARBALL}" -C "${SRC_PARENT}"
-    # Tarball directory is like vendor/php-8.4.0
     EXTRACT_DIR="${SRC_PARENT}/${PHP_REF}"
     if [ ! -d "${EXTRACT_DIR}" ]; then
-      # Fallback: guess from glob
       EXTRACT_DIR="$(ls -d ${SRC_PARENT}/php-*/ | head -n1)"
       EXTRACT_DIR="${EXTRACT_DIR%/}"
     fi
@@ -53,7 +51,7 @@ echo "[*] Stubbing PCRE2 JIT sources for WASM (pcre2_jit_*.c and sljit/*.c)..."
 STUB_COUNT=0
 # 1) Stub any pcre2_jit_*.c files
 while IFS= read -r -d '' f; do
-  if [ ! -f "${f}.upstream" ]; then mv "$f" "${f}.upstream"; fi
+  if [ ! -f "${f}.upstream"} ]; then mv "$f" "${f}.upstream"; fi
   cat > "$f" <<'EOF'
 /* WASM build: PCRE2 JIT disabled, empty translation unit */
 #define PCRE2_CODE_UNIT_WIDTH 8
@@ -229,6 +227,27 @@ cat > "${COMPAT_HDR}" <<'EOF'
 EOF
 echo "  - added ${COMPAT_HDR}"
 
+# Pre-patch 5: ensure ps_title.c has a harmless setproctitle stub for Emscripten
+PS_TITLE_C="sapi/cli/ps_title.c"
+if [ -f "${PS_TITLE_C}" ]; then
+  if [ ! -f "${PS_TITLE_C}.upstream" ]; then
+    mv "${PS_TITLE_C}" "${PS_TITLE_C}.upstream"
+    echo "  - backing up ${PS_TITLE_C} -> ${PS_TITLE_C}.upstream"
+  fi
+  {
+    cat <<'EOF'
+/* WASM: provide a no-op setproctitle to satisfy PS_USE_SETPROCTITLE on Emscripten */
+#if defined(__EMSCRIPTEN__) && !defined(HAVE_SETPROCTITLE)
+__attribute__((unused))
+static void setproctitle(const char *fmt, ...) { (void)fmt; }
+#endif
+EOF
+    cat "${PS_TITLE_C}.upstream"
+  } > "${PS_TITLE_C}"
+  echo "  - injected setproctitle() stub into ${PS_TITLE_C}"
+  STUB_COUNT=$((STUB_COUNT+1))
+fi
+
 echo "[*] Total stubbed files: ${STUB_COUNT}"
 
 # Cross triples
@@ -241,8 +260,8 @@ COMMON_EM_FLAGS='-s EXIT_RUNTIME=0 -s ERROR_ON_UNDEFINED_SYMBOLS=0 -s WASM=1 -s 
 # Use absolute path for the forced-include header so it works in all subdirs
 SYSLOG_COMPAT_ABS="${PWD}/main/php_wasm_syslog_compat.h"
 
-# Force-disable PS_USE_SETPROCTITLE and provide other CPP flags
-CPPFLAGS_IN="${EMCC_CPPFLAGS:-} -DPCRE2_CODE_UNIT_WIDTH=8 -DPCRE2_DISABLE_JIT -DSUPPORT_JIT=0 -DHAVE_PCRE_JIT=0 -DSLJIT_CONFIG_UNSUPPORTED=1 -DPS_USE_SETPROCTITLE=0 -include ${SYSLOG_COMPAT_ABS}"
+# Keep our conservative CPP flags; we still tell configure we don't have setproctitle
+CPPFLAGS_IN="${EMCC_CPPFLAGS:-} -DPCRE2_CODE_UNIT_WIDTH=8 -DPCRE2_DISABLE_JIT -DSUPPORT_JIT=0 -DHAVE_PCRE_JIT=0 -DSLJIT_CONFIG_UNSUPPORTED=1 -include ${SYSLOG_COMPAT_ABS}"
 CFLAGS_IN="${EMCC_CFLAGS:- -O3}"
 LDFLAGS_IN="${EMCC_LDFLAGS:-} ${COMMON_EM_FLAGS}"
 
@@ -287,7 +306,7 @@ EC=${PIPESTATUS[0]}
 set +o pipefail
 if [ ${EC} -ne 0 ]; then
   echo "[-] Build failed. Showing relevant compiler errors from build.log:"
-  { 
+  {
     grep -nE "(/emscripten/em(cc|\+\+)| error: |: error:|No such file or directory|command not found|bison|re2c|php_wasm_syslog_compat.h|setproctitle|ps_title\\.c)" "${OUT_DIR}/build.log" | tail -n 200;
     echo "---- tail of build.log (last 400 lines) ----";
     tail -n 400 "${OUT_DIR}/build.log";
