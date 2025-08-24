@@ -20,7 +20,6 @@ cd "${PHP_DIR}"
 echo "[*] Running buildconf..."
 ./buildconf --force
 
-# 交叉编译三元组
 HOST_TRIPLE="wasm32-unknown-emscripten"
 BUILD_TRIPLE="$(/bin/sh build/config.guess || echo x86_64-pc-linux-gnu)"
 
@@ -37,7 +36,7 @@ emconfigure ./configure \
   --enable-cli \
   --disable-zts \
   --without-pear \
-  --without-pcre-jit \
+  --with-pcre-jit=no \
   CFLAGS="${CFLAGS_IN}" LDFLAGS="${LDFLAGS_IN}"
 CFG_RC=$?
 set -e
@@ -48,11 +47,34 @@ if [ $CFG_RC -ne 0 ]; then
   exit $CFG_RC
 fi
 
-# 可视化确认：JIT 相关宏
-echo "[*] Checking PCRE2 headers for JIT macros (best-effort)..."
-grep -nE 'JIT' ext/pcre/pcre2lib/*.h || true
+# 兜底：若 Makefile 仍然引用 PCRE2 JIT/SLJIT 源，直接剔除（避免编译）
+echo "[*] Checking Makefile(s) for unintended PCRE2 JIT objects..."
+NEED_STRIP=0
+for f in Makefile Makefile.objects ext/pcre/Makefile; do
+  if [ -f "$f" ] && grep -qE 'pcre2_jit_(compile|match)\.|sljit/' "$f"; then
+    echo "  - JIT refs found in $f"
+    NEED_STRIP=1
+  fi
+done
 
-# 降低并行度便于阅读日志
+if [ "$NEED_STRIP" = "1" ]; then
+  echo "[*] Stripping JIT/SLJIT objects from Makefiles..."
+  for f in Makefile Makefile.objects ext/pcre/Makefile; do
+    [ -f "$f" ] || continue
+    sed -i -E '/pcre2_jit_(compile|match)\.(lo|o)/d' "$f" || true
+    sed -i -E '/sljit\//d' "$f" || true
+  done
+  echo "[*] After strip, verifying..."
+  for f in Makefile Makefile.objects ext/pcre/Makefile; do
+    [ -f "$f" ] || continue
+    if grep -qE 'pcre2_jit_(compile|match)\.|sljit/' "$f"; then
+      echo "[-] Still found JIT refs in $f"
+      exit 1
+    fi
+  done
+fi
+
+# 降低并行度，便于阅读日志（需要可以上调 JOBS）
 JOBS="${JOBS:-1}"
 echo "[*] emmake make -j${JOBS} V=1 ..."
 emmake make -j"${JOBS}" V=1 || {
@@ -76,7 +98,6 @@ else
   exit 1
 fi
 
-# 校验输出
 if [ ! -f "${OUT_DIR}/php_8_4.js" ] || [ ! -f "${OUT_DIR}/php_8_4.wasm" ]; then
   echo "[-] Missing outputs. Listing sapi/cli and ${OUT_DIR}:"
   ls -lah sapi/cli/ || true
