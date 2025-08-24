@@ -87,6 +87,122 @@ EOF
   STUB_COUNT=$((STUB_COUNT+1))
 fi
 
+# Pre-patch 4: add a compatibility header to provide LOG_* constants
+# and force-include it during compilation (so basic_functions can register constants).
+COMPAT_HDR="main/php_wasm_syslog_compat.h"
+cat > "${COMPAT_HDR}" <<'EOF'
+#ifndef PHP_WASM_SYSLOG_COMPAT_H
+#define PHP_WASM_SYSLOG_COMPAT_H
+/* Minimal syslog constants for environments without <syslog.h> (e.g., Emscripten). */
+/* Priorities */
+#ifndef LOG_EMERG
+# define LOG_EMERG   0
+#endif
+#ifndef LOG_ALERT
+# define LOG_ALERT   1
+#endif
+#ifndef LOG_CRIT
+# define LOG_CRIT    2
+#endif
+#ifndef LOG_ERR
+# define LOG_ERR     3
+#endif
+#ifndef LOG_WARNING
+# define LOG_WARNING 4
+#endif
+#ifndef LOG_NOTICE
+# define LOG_NOTICE  5
+#endif
+#ifndef LOG_INFO
+# define LOG_INFO    6
+#endif
+#ifndef LOG_DEBUG
+# define LOG_DEBUG   7
+#endif
+/* Facilities (glibc-compatible values) */
+#ifndef LOG_KERN
+# define LOG_KERN    (0<<3)
+#endif
+#ifndef LOG_USER
+# define LOG_USER    (1<<3)
+#endif
+#ifndef LOG_MAIL
+# define LOG_MAIL    (2<<3)
+#endif
+#ifndef LOG_DAEMON
+# define LOG_DAEMON  (3<<3)
+#endif
+#ifndef LOG_AUTH
+# define LOG_AUTH    (4<<3)
+#endif
+#ifndef LOG_SYSLOG
+# define LOG_SYSLOG  (5<<3)
+#endif
+#ifndef LOG_LPR
+# define LOG_LPR     (6<<3)
+#endif
+#ifndef LOG_NEWS
+# define LOG_NEWS    (7<<3)
+#endif
+#ifndef LOG_UUCP
+# define LOG_UUCP    (8<<3)
+#endif
+#ifndef LOG_CRON
+# define LOG_CRON    (9<<3)
+#endif
+#ifndef LOG_AUTHPRIV
+# define LOG_AUTHPRIV (10<<3)
+#endif
+#ifndef LOG_FTP
+# define LOG_FTP     (11<<3)
+#endif
+#ifndef LOG_LOCAL0
+# define LOG_LOCAL0  (16<<3)
+#endif
+#ifndef LOG_LOCAL1
+# define LOG_LOCAL1  (17<<3)
+#endif
+#ifndef LOG_LOCAL2
+# define LOG_LOCAL2  (18<<3)
+#endif
+#ifndef LOG_LOCAL3
+# define LOG_LOCAL3  (19<<3)
+#endif
+#ifndef LOG_LOCAL4
+# define LOG_LOCAL4  (20<<3)
+#endif
+#ifndef LOG_LOCAL5
+# define LOG_LOCAL5  (21<<3)
+#endif
+#ifndef LOG_LOCAL6
+# define LOG_LOCAL6  (22<<3)
+#endif
+#ifndef LOG_LOCAL7
+# define LOG_LOCAL7  (23<<3)
+#endif
+/* Options */
+#ifndef LOG_PID
+# define LOG_PID     0x01
+#endif
+#ifndef LOG_CONS
+# define LOG_CONS    0x02
+#endif
+#ifndef LOG_ODELAY
+# define LOG_ODELAY  0x04
+#endif
+#ifndef LOG_NDELAY
+# define LOG_NDELAY  0x08
+#endif
+#ifndef LOG_NOWAIT
+# define LOG_NOWAIT  0x10
+#endif
+#ifndef LOG_PERROR
+# define LOG_PERROR  0x20
+#endif
+#endif /* PHP_WASM_SYSLOG_COMPAT_H */
+EOF
+echo "  - added ${COMPAT_HDR}"
+
 echo "[*] Total stubbed files: ${STUB_COUNT}"
 
 # Cross triples
@@ -95,11 +211,12 @@ BUILD_TRIPLE="$(/bin/sh build/config.guess || echo x86_64-pc-linux-gnu)"
 
 # Build flags
 COMMON_EM_FLAGS='-s EXIT_RUNTIME=0 -s ERROR_ON_UNDEFINED_SYMBOLS=0 -s WASM=1 -s MODULARIZE=1 -s EXPORT_ES6=1 -s ENVIRONMENT=worker -s ALLOW_MEMORY_GROWTH=1 -s FILESYSTEM=1'
-CPPFLAGS_IN="${EMCC_CPPFLAGS:-} -DPCRE2_CODE_UNIT_WIDTH=8 -DPCRE2_DISABLE_JIT -DSUPPORT_JIT=0 -DHAVE_PCRE_JIT=0 -DSLJIT_CONFIG_UNSUPPORTED=1"
+# Force-include the syslog compat header so LOG_* constants always exist.
+CPPFLAGS_IN="${EMCC_CPPFLAGS:-} -DPCRE2_CODE_UNIT_WIDTH=8 -DPCRE2_DISABLE_JIT -DSUPPORT_JIT=0 -DHAVE_PCRE_JIT=0 -DSLJIT_CONFIG_UNSUPPORTED=1 -include main/php_wasm_syslog_compat.h"
 CFLAGS_IN="${EMCC_CFLAGS:- -O3}"
 LDFLAGS_IN="${EMCC_LDFLAGS:-} ${COMMON_EM_FLAGS}"
 
-# Hint autoconf to avoid selecting syslog and dns paths
+# Hint autoconf to avoid selecting syslog and dns paths (double insurance)
 export ac_cv_func_dns_search=no
 export ac_cv_func_dns_open=no
 export ac_cv_func_dns_free=no
