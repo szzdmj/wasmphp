@@ -108,63 +108,10 @@ export async function init(RuntimeName, PHPLoader) {
             this.status = status;
         }
     };
-    var callRuntimeCallbacks = callbacks => { while (callbacks.length > 0) { callbacks.shift()(Module); } };
-    var onPostRuns = [];
-    var addOnPostRun = cb => onPostRuns.unshift(cb);
-    var onPreRuns = [];
-    var addOnPreRun = cb => onPreRuns.unshift(cb);
-    var noExitRuntime = Module["noExitRuntime"] || false;
-    var stackRestore = val => __emscripten_stack_restore(val);
-    var stackSave = () => _emscripten_stack_get_current();
-    var UTF8Decoder = typeof TextDecoder != "undefined" ? new TextDecoder("utf8") : undefined;
-
-    PHPLoader.debug = 'debug' in PHPLoader ? PHPLoader.debug : true;
-    if (PHPLoader.debug && typeof Asyncify !== "undefined") {
-        const originalHandleSleep = Asyncify.handleSleep;
-        Asyncify.handleSleep = function (startAsync) {
-            if (!ABORT) {
-                Module["lastAsyncifyStackSource"] = new Error();
-            }
-            return originalHandleSleep(startAsync);
-        }
-    }
-
-    const originalRemoveRunDependency = PHPLoader['removeRunDependency'];
-    PHPLoader['removeRunDependency'] = function (...args) {
-        try {
-            originalRemoveRunDependency(...args);
-        } catch (e) {
-            PHPLoader['onAbort'](e);
-        }
-    }
-
-    PHPLoader['malloc'] = _malloc;
-    PHPLoader['free'] = typeof _free === 'function' ? _free : PHPLoader['_wasm_free'];
-
-    if (typeof NODEFS === 'object') {
-        const originalCreateNode = NODEFS.createNode;
-        NODEFS.createNode = function createNodeWithSharedFlag() {
-            const node = originalCreateNode.apply(NODEFS, arguments);
-            node.isSharedFS = true;
-            return node;
-        };
-
-        var originalHashAddNode = FS.hashAddNode;
-        FS.hashAddNode = function hashAddNodeIfNotSharedFS(node) {
-            if (
-                typeof locking === 'object' &&
-                locking?.is_shared_fs_node(node)
-            ) {
-                return;
-            }
-            return originalHashAddNode.apply(FS, arguments);
-        };
-    }
-
-    PHPLoader['phpVersion'] = (() => {
-        const [major, minor, patch] = phpVersionString.split('.').map(Number);
-        return { major, minor, patch };
-    })();
+addOnPostRun(() => {
+  PHPLoader.malloc = Module._malloc || (Module.cwrap && Module.cwrap('malloc', 'number', ['number']));
+  PHPLoader.free = Module._free || (Module.cwrap && Module.cwrap('free', null, ['number'])) || PHPLoader._wasm_free;
+});
 
     return PHPLoader;
 }
