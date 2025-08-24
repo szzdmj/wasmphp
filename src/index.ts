@@ -1,16 +1,11 @@
-// 默认保留“早上”的整体结构（路由/探针/打印等）。
-// 关键修正：locateFile 不再使用 import.meta.url，避免在 Workers 环境中抛错。
-// 支持调试开关：
-// - ?useUpstream=1   -> .wasm 走 GitHub raw（避免自调用）
-// - ?useOrigin=scripts|wasm -> .wasm 走同源路径（仅外部访问可用；Worker 内部自调用可能 404）
-// - ?inline=1        -> 预抓取 upstream 的 .wasm 字节并以 wasmBinary 传入，彻底避免网络加载
+// 关键修正：不再通过静态 import 加载 Emscripten 产物（其内部用到了 import.meta.url）。
+// 改为：从 GitHub raw 拉取 scripts/php_8_4.js 源码，内存中将 import.meta.url 安全替换，再用 new Function 评估导出工厂。
+// 其余：保留 /scripts 与 /wasm 反代路由、/__probe 探针、?useUpstream=1 与 ?inline=1 调试开关。
 
-import createPHP from '../scripts/php_8_4.js';
-
-// 如需锁定稳定版本，可将 main 换为固定 commit SHA
+// 如需锁定稳定版本，建议将 main 换为固定 commit SHA
+const JS_UPSTREAM = 'https://raw.githubusercontent.com/szzdmj/wasmphp/main/scripts/php_8_4.js';
 const WASM_UPSTREAM = 'https://raw.githubusercontent.com/szzdmj/wasmphp/main/scripts/php_8_4.wasm';
 
-// 同源提供的两个备用路径（均反代到 upstream）
 const SCRIPTS_PATH = '/scripts/php_8_4.wasm';
 const WASM_PATH = '/wasm/php_8_4.wasm';
 
@@ -30,6 +25,45 @@ async function fetchInfo(urlStr: string): Promise<FetchInfo> {
   } catch (e: any) {
     return { ok: false, status: -1, headers: {}, error: e?.stack || String(e) };
   }
+}
+
+// 动态加载并“打补丁”的 Emscripten 工厂：移除 import/export 语法并屏蔽 import.meta.url 的使用
+async function loadCreatePHP(): Promise<(opts: any) => Promise<any>> {
+  const res = await fetch(JS_UPSTREAM, {
+    // @ts-ignore 可选缓存
+    cf: { cacheTtl: 300, cacheEverything: true },
+  });
+  if (!res.ok) {
+    throw new Error(`Fetch JS upstream failed: ${res.status}`);
+  }
+  let code = await res.text();
+
+  // 1) 屏蔽 import.meta.url 的使用（避免在 Workers 中为 undefined 时进入 new URL(...).href 逻辑）
+  // 粗暴但有效：把所有 import.meta.url 替换为 undefined（Emscripten 有多环境分支，后续会走其它路径）
+  code = code.replaceAll('import.meta.url', 'undefined');
+
+  // 2) 去掉 ESM 导出语法，改为挂到全局，供后续读取
+  code = code.replace('export default Module;', 'globalThis.__PHP_FACTORY__ = Module;');
+
+  // 3) 在受控作用域执行（Cloudflare Workers 允许 new Function）
+  // 提供极少的环境变量以避免 Node 分支误判
+  const wrapper = `
+    (function () {
+      var module = undefined;
+      var require = undefined;
+      var window = undefined;
+      var document = undefined;
+      ${code}
+    })();
+  `;
+  // eslint-disable-next-line no-new-func
+  new Function(wrapper)();
+
+  const factory = (globalThis as any).__PHP_FACTORY__;
+  if (typeof factory !== 'function') {
+    throw new Error('Patched PHP factory not found on globalThis');
+  }
+  return factory;
 }
 
 export default {
@@ -95,9 +129,8 @@ export default {
       });
     }
 
-    // 探针
+    // 探针：保留自调用特征检测
     if (url.pathname === '/__probe') {
-      // import.meta.url 在 Workers 模块中常为不可用，这里仅报告，不再依赖
       let importMetaUrl: string | null = null;
       try {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -161,20 +194,22 @@ export default {
         wasmBinary = new Uint8Array(buf);
       }
 
+      // 动态加载已“打补丁”的 Emscripten 工厂
+      const createPHP = await loadCreatePHP();
+
       const php = await createPHP({
         // 若提供 wasmBinary，Emscripten 将不会再发起网络请求加载 .wasm
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         ...(wasmBinary ? ({ wasmBinary } as any) : {}),
         locateFile: (p: string) => {
-          // 关键修正：完全不再使用 import.meta.url
+          // 完全不再使用 import.meta.url
           if (p.endsWith('.wasm')) {
             if (useUpstream) return WASM_UPSTREAM;
             if (useOrigin === 'wasm') return `${url.origin}/wasm/${p}`;
             if (useOrigin === 'scripts') return `${url.origin}/scripts/${p}`;
-            // 默认仍指向同源 scripts（便于与你的“早上状态”对照；内部自调用会 404，可用开关绕过）
+            // 默认指向同源 scripts（外部访问可用；内部自调用会 404，可用开关或 inline/Upstream 绕过）
             return `${url.origin}/scripts/${p}`;
           }
-          // 对非 .wasm 资源，返回原样或映射到 scripts，同样不触发 import.meta.url
           return p;
         },
         print: (txt: string) => { out += txt + '\n'; },
