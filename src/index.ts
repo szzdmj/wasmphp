@@ -1,7 +1,7 @@
 // Remove dynamic code generation and default to inline wasmBinary.
 // Keep proxy routes (/scripts/php_8_4.wasm, /wasm/php_8_4.wasm) and probe (/__probe).
 
-import createPHP from '../scripts/php_8_4.js';
+import createPHP from '../scripts/php_8_4_cf.js';
 
 const JS_UPSTREAM = 'https://raw.githubusercontent.com/szzdmj/wasmphp/main/scripts/php_8_4.js';
 const WASM_UPSTREAM = 'https://raw.githubusercontent.com/szzdmj/wasmphp/main/scripts/php_8_4.wasm';
