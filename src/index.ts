@@ -1,41 +1,32 @@
-// 保持“早上的代码状态”：主路径仍使用 import.meta.url 的 locateFile（方便复现当前错误）。
+// 保持“早上的代码状态”：默认主路径仍使用 import.meta.url 的 locateFile（便于复现当前错误）。
 // 最小增量：
-// 1) 新增 /scripts/php_8_4.wasm 路由，把 GitHub raw 的 wasm 反代到同源，供探针与后续切换使用；
-// 2) 新增 /__probe 探针，显示 import.meta.url 可用性、两种候选 wasm URL 及抓取结果；
-// 3) 新增 /health 健康检查。
-// 注意：这版不会改变主路径行为（依旧可能因 import.meta.url 在 Worker 环境下不可用而报错），
-// 目的是先把探针打通，再按你的节奏逐句修正。
+// - /scripts/php_8_4.wasm：反代 GitHub raw 的 wasm 到同源，并标记响应头便于探针判定是否命中 Worker。
+// - /__probe：检查 import.meta.url、同源 /scripts 路由是否生效、同源与 upstream 的抓取结果。
+// - /health：健康检查。
+// - 调试开关：在请求 URL 加上 ?useOrigin=1 时，locateFile 对 .wasm 改走同源路径，绕过 import.meta.url 以便验证执行链路。
+//   例如：/?useOrigin=1 或 /info?useOrigin=1
 
 import createPHP from '../scripts/php_8_4.js';
 
-// 如需锁定版本，可将 main 替换为固定 commit SHA 以稳定复现
-const WASM_UPSTREAM =
-  'https://raw.githubusercontent.com/szzdmj/wasmphp/main/scripts/php_8_4.wasm';
+// 如需锁定稳定版本，请把 main 替换为具体 commit SHA
+const WASM_UPSTREAM = 'https://raw.githubusercontent.com/szzdmj/wasmphp/main/scripts/php_8_4.wasm';
+const WASM_PATH = '/scripts/php_8_4.wasm';
 
-async function tryFetch(urlStr: string): Promise<{
+type FetchInfo = {
   ok: boolean;
   status: number;
-  contentType: string | null;
-  contentLength: string | null;
+  headers: Record<string, string>;
   error: string | null;
-}> {
+};
+
+async function fetchInfo(urlStr: string): Promise<FetchInfo> {
   try {
     const r = await fetch(urlStr, { method: 'GET' });
-    return {
-      ok: r.ok,
-      status: r.status,
-      contentType: r.headers.get('content-type'),
-      contentLength: r.headers.get('content-length'),
-      error: null,
-    };
+    const headers: Record<string, string> = {};
+    for (const [k, v] of r.headers) headers[k] = v;
+    return { ok: r.ok, status: r.status, headers, error: null };
   } catch (e: any) {
-    return {
-      ok: false,
-      status: -1,
-      contentType: null,
-      contentLength: null,
-      error: e?.stack || String(e),
-    };
+    return { ok: false, status: -1, headers: {}, error: e?.stack || String(e) };
   }
 }
 
@@ -48,37 +39,46 @@ export default {
       return new Response('ok', { headers: { 'content-type': 'text/plain' } });
     }
 
-    // 将仓库中的 wasm 反代为同源路径，供 locateFile/probe 使用
-    if (url.pathname === '/scripts/php_8_4.wasm') {
+    // 反代仓库中的 wasm 到同源路径，供 locateFile/probe 使用
+    if (url.pathname === WASM_PATH) {
       const upstream = WASM_UPSTREAM;
       const res = await fetch(upstream, {
-        // @ts-ignore 启用 Cloudflare 边缘缓存（可选）
+        // @ts-ignore Cloudflare 边缘缓存（可选）
         cf: { cacheTtl: 300, cacheEverything: true },
       });
       if (!res.ok) {
-        return new Response(`Upstream wasm fetch failed: ${res.status}`, { status: 502 });
+        return new Response(`Upstream wasm fetch failed: ${res.status}`, {
+          status: 502,
+          headers: {
+            'content-type': 'text/plain; charset=utf-8',
+            'x-worker-route': 'true',
+            'x-wasm-upstream-status': String(res.status),
+          },
+        });
       }
       const body = await res.arrayBuffer();
       return new Response(body, {
         headers: {
           'content-type': 'application/wasm',
           'cache-control': 'public, max-age=300',
+          'x-worker-route': 'true',
+          'x-wasm-upstream-status': String(res.status),
         },
       });
     }
 
-    // 探针：检查 import.meta.url 与两种候选 wasm URL 的可达性
+    // 探针：检查 import.meta.url 可用性、同源路由是否生效、以及同源/上游的抓取情况
     if (url.pathname === '/__probe') {
+      // 1) import.meta.url
       let importMetaUrl: string | null = null;
       try {
-        // 某些环境 import.meta 存在但无 url；用可选链避免抛错
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         importMetaUrl = (import.meta as any)?.url ?? null;
       } catch {
         importMetaUrl = null;
       }
 
-      // 基于 import.meta.url 计算的候选 URL（如果可用）
+      // 2) 基于 import.meta 推导（如不可用则为 null）
       let wasmURL_from_importMeta: string | null = null;
       if (importMetaUrl) {
         try {
@@ -88,32 +88,30 @@ export default {
         }
       }
 
-      // 基于当前请求 origin 的同源 URL（由上面的反代路由提供）
-      const wasmURL_from_origin = `${url.origin}/scripts/php_8_4.wasm`;
+      // 3) 基于同源路径
+      const wasmURL_from_origin = `${url.origin}${WASM_PATH}`;
 
-      // 分别尝试抓取
-      const fetch_from_importMeta = wasmURL_from_importMeta
-        ? await tryFetch(wasmURL_from_importMeta)
-        : {
-            ok: false,
-            status: -1,
-            contentType: null,
-            contentLength: null,
-            error: 'import.meta.url unavailable',
-          };
+      // 4) 检查同源路由是否真的命中到 Worker（通过自定义响应头判断）
+      const routeCheck = await fetchInfo(`${wasmURL_from_origin}?__ping=1`);
+      const routeHit = routeCheck.headers['x-worker-route'] === 'true';
 
-      const fetch_from_origin = await tryFetch(wasmURL_from_origin);
+      // 5) 分别采集抓取信息
+      const fromImportMeta = wasmURL_from_importMeta
+        ? await fetchInfo(wasmURL_from_importMeta)
+        : { ok: false, status: -1, headers: {}, error: 'import.meta.url unavailable' };
+
+      const fromOrigin = await fetchInfo(wasmURL_from_origin);
+      const fromUpstream = await fetchInfo(WASM_UPSTREAM);
 
       const payload = {
         importMetaUrlPresent: typeof importMetaUrl === 'string',
         importMetaUrl,
         wasmURL_from_importMeta,
         wasmURL_from_origin,
-        fetch_from_importMeta: {
-          tried: !!wasmURL_from_importMeta,
-          ...fetch_from_importMeta,
-        },
-        fetch_from_origin,
+        routeHit, // true 表示 /scripts 路由已在 Worker 中生效
+        fetch_from_importMeta: fromImportMeta,
+        fetch_from_origin: fromOrigin,
+        fetch_from_upstream: fromUpstream,
       };
 
       return new Response(JSON.stringify(payload, null, 2), {
@@ -121,13 +119,19 @@ export default {
       });
     }
 
-    // 正常路径：保持“早上的代码状态”（用 import.meta.url 定位 wasm），以便复现当前错误进行对照
+    // 正常路径：仍保持“早上的写法”，但加入一个仅用于排查的开关 ?useOrigin=1
     let out = '';
     try {
+      const useOrigin = url.searchParams.get('useOrigin') === '1';
+
       const php = await createPHP({
-        // 原始写法：基于 import.meta.url 计算 wasm 位置（错误就发生在这里）
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        locateFile: (p: string) => new URL(`../scripts/${p}`, (import.meta as any).url).href,
+        locateFile: (p: string) => {
+          // 调试开关：当 ?useOrigin=1 时，仅对 .wasm 返回同源 URL，避免 import.meta.url
+          if (useOrigin && p.endsWith('.wasm')) return `${url.origin}/scripts/${p}`;
+          // 原始写法：基于 import.meta.url（在 Worker 模块里会触发你现在的报错）
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          return new URL(`../scripts/${p}`, (import.meta as any).url).href;
+        },
         print: (txt: string) => {
           out += txt + '\n';
         },
