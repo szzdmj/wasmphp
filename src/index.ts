@@ -1,4 +1,6 @@
-// V29: 以 options 为首参，清理错误 wasmBinary，强制走 instantiateWasm，显式等待 onRuntimeInitialized
+// V28: 探针版（不等待 onRuntimeInitialized，不会阻塞）
+// - 保留 /__diag /__jsplus /__probe 诊断
+// - 根路径返回诊断信息，提示需要单线程构建
 
 async function normalizeWasmModule(wasmDefault: any): Promise<WebAssembly.Module> {
   if (wasmDefault && wasmDefault.constructor?.name === "Module") return wasmDefault as WebAssembly.Module;
@@ -10,172 +12,121 @@ async function normalizeWasmModule(wasmDefault: any): Promise<WebAssembly.Module
   throw new Error("Unsupported wasm default export type: " + (wasmDefault?.constructor?.name || typeof wasmDefault));
 }
 
-function keysOf(v: any, max = 80) { try { return Object.keys(v || {}).slice(0, max); } catch { return []; } }
 function briefType(v: any) {
   const t = typeof v;
-  return { type: t, ctor: v?.constructor?.name || null, isFunction: t === "function", isPromise: !!v && typeof v.then === "function" };
+  const ctor = v?.constructor?.name || null;
+  return { type: t, ctor, isFunction: t === "function", isPromise: !!v && typeof v.then === "function" };
 }
 
-async function waitOnRuntimeInitialized(mod: any, timeoutMs = 20000): Promise<boolean> {
-  return new Promise((resolve) => {
-    let done = false;
-    const prev = mod.onRuntimeInitialized;
-    mod.onRuntimeInitialized = () => {
-      try { if (typeof prev === "function") prev(); } catch {}
-      if (!done) { done = true; resolve(true); }
-    };
-    setTimeout(() => { if (!done) resolve(false); }, timeoutMs);
-  });
-}
+function keysOf(v: any, max = 50) { try { return Object.keys(v || {}).slice(0, max); } catch { return []; } }
 
 export default {
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
 
-    if (!(url.pathname === "/" || url.pathname === "/index.php" || url.pathname === "/__probe")) {
-      return new Response("OK", { headers: { "content-type": "text/plain; charset=utf-8" } });
+    if (url.pathname === "/__ping") return new Response("pong");
+
+    if (url.pathname === "/__diag") {
+      try {
+        const wasmMod = await import("../scripts/php_8_4.wasm");
+        const raw = (wasmMod as any).default;
+        const normalized = await normalizeWasmModule(raw);
+        return new Response(JSON.stringify({
+          imported: !!raw,
+          type: raw?.constructor?.name || typeof raw,
+          normalized: normalized?.constructor?.name
+        }), { headers: { "content-type": "application/json" } });
+      } catch (e: any) {
+        return new Response(JSON.stringify({ imported: false, error: e?.message || String(e) }), {
+          status: 500, headers: { "content-type": "application/json" }
+        });
+      }
     }
 
-    try {
-      // 1) 导入 JS & WASM
+    if (url.pathname === "/__jsplus") {
       const jsMod = await import("../scripts/php_8_4.js");
-      const init: any = (jsMod as any).init;
-      const dep: any = (jsMod as any).dependencyFilename;       // 实际是 WebAssembly.Module
-      const depSize: any = (jsMod as any).dependenciesTotalSize; // 数字大小（约 19MB）
-      if (typeof init !== "function") {
-        return new Response("Runtime error: export 'init' not found or not a function", { status: 500 });
-      }
+      return new Response(JSON.stringify({
+        exportKeys: keysOf(jsMod),
+        dependencyFilename: briefType((jsMod as any).dependencyFilename),
+        dependenciesTotalSize: (jsMod as any).dependenciesTotalSize ?? null,
+        init: briefType((jsMod as any).init),
+      }), { headers: { "content-type": "application/json" } });
+    }
 
-      const wasmMod = await import("../scripts/php_8_4.wasm");
-      const wasmModule = await normalizeWasmModule((wasmMod as any).default);
+    if (url.pathname === "/__probe") {
+      try {
+        const jsMod = await import("../scripts/php_8_4.js");
+        const init: any = (jsMod as any).init;
+        const dep: any = (jsMod as any).dependencyFilename;
+        const depSize: any = (jsMod as any).dependenciesTotalSize;
 
-      // 2) Emscripten 选项（同步实例化）
-      const stdout: string[] = [];
-      const stderr: string[] = [];
+        const wasmMod = await import("../scripts/php_8_4.wasm");
+        const wasmModule = await normalizeWasmModule((wasmMod as any).default);
 
-      const instantiate = (
-        imports: WebAssembly.Imports,
-        ok: (inst: WebAssembly.Instance) => void
-      ) => {
-        const instance = new WebAssembly.Instance(wasmModule, imports);
-        ok(instance);
-        return instance.exports as any;
-      };
+        const stdout: string[] = [];
+        const stderr: string[] = [];
+        const moduleOptions: any = {
+          noInitialRun: true,
+          print: (txt: string) => { try { stdout.push(String(txt)); } catch {} },
+          printErr: (txt: string) => { try { stderr.push(String(txt)); } catch {} },
+          onAbort: (reason: any) => { try { stderr.push("[abort] " + String(reason)); } catch {} },
+          locateFile: (path: string, base?: string) => {
+            try { stderr.push("[locateFile] " + path + " base=" + (base || "")); } catch {}
+            return path;
+          },
+          instantiateWasm: (imports: WebAssembly.Imports, ok: (inst: WebAssembly.Instance) => void) => {
+            const instance = new WebAssembly.Instance(wasmModule, imports);
+            ok(instance);
+            return instance.exports as any;
+          },
+        };
 
-      const baseOptions: any = {
-        noInitialRun: true,
-        print: (txt: string) => { try { stdout.push(String(txt)); } catch {} },
-        printErr: (txt: string) => { try { stderr.push(String(txt)); } catch {} },
-        onAbort: (reason: any) => { try { stderr.push("[abort] " + String(reason)); } catch {} },
-        locateFile: (path: string, base?: string) => {
-          // 仅记录是否尝试加载附加资源（理论上不会触发）
-          try { stderr.push("[locateFile] " + path + " base=" + (base || "")); } catch {}
-          return path;
-        },
-        instantiateWasm: instantiate,
-      };
+        const attempts: Array<{ label: string, call: () => any }> = [
+          { label: "init(dep, options)", call: () => init(dep, { ...moduleOptions }) },
+          { label: "init(options)", call: () => init({ ...moduleOptions }) },
+          { label: "init('WORKER', options)", call: () => init("WORKER", { ...moduleOptions }) },
+          { label: "init(dep, depSize)", call: () => init(dep, depSize) },
+          { label: "init(depSize, dep)", call: () => init(depSize, dep) },
+          { label: "init(dep, depSize, options)", call: () => init(dep, depSize, { ...moduleOptions }) },
+          { label: "init(depSize, options)", call: () => init(depSize, { ...moduleOptions }) },
+          { label: "init({ ...options, locateFile: () => String(dep) })", call: () => init({ ...moduleOptions, locateFile: () => String(dep) }) },
+        ];
 
-      // 3) 尝试多种签名（以 options 为首，避免把 wasmBinary 设成 Module）
-      const attempts: Array<{ label: string; args: any[] }> = [
-        { label: "init(options)", args: [ { ...baseOptions } ] },
-        { label: "init(options, depSize)", args: [ { ...baseOptions }, depSize ] },
-        { label: "init(options, dep)", args: [ { ...baseOptions }, dep ] },
-        { label: "init(options, depSize, dep)", args: [ { ...baseOptions }, depSize, dep ] },
-        { label: "init(options, dep, depSize)", args: [ { ...baseOptions }, dep, depSize ] },
-        // 兜底：历史尝试里这些会返回“被修改的 options 对象”，本次会等待 onRuntimeInitialized
-        { label: "init(dep, options)", args: [ dep, { ...baseOptions } ] },
-        { label: "init('WORKER', options)", args: [ "WORKER", { ...baseOptions } ] },
-      ];
-
-      const probe: any[] = [];
-      let php: any;
-
-      for (const at of attempts) {
-        let m: any = undefined;
-        let note = "";
-        try {
-          const ret = init(...at.args);
-          m = (ret && typeof ret.then === "function") ? await ret : ret;
-
-          // 若返回函数，按工厂再调用一次
-          if (typeof m === "function") {
-            note = "returned function -> call with options";
-            let tmp = m({ ...baseOptions });
-            m = (tmp && typeof tmp.then === "function") ? await tmp : tmp;
+        const probe: any[] = [];
+        for (const a of attempts) {
+          try {
+            let res = a.call();
+            if (res && typeof res.then === "function") res = await res;
+            if (typeof res === "function") {
+              let tmp = res({ ...moduleOptions });
+              res = (tmp && typeof tmp.then === "function") ? await tmp : tmp;
+            }
+            // 不等待 runtime，就直接记录
+            probe.push({ label: a.label, result: briefType(res), keys: keysOf(res) });
+          } catch (e: any) {
+            probe.push({ label: a.label, error: e?.message || String(e) });
           }
-
-          // 如果回的是“被修改的 options 对象/Module 对象”，确保走 instantiateWasm 分支
-          if (m && typeof m === "object") {
-            try {
-              if (m.wasmBinary && m.wasmBinary.constructor?.name === "Module") {
-                // 删除错误类型的 wasmBinary，避免 Emscripten误用
-                delete m.wasmBinary;
-                note += (note ? " | " : "") + "delete wasmBinary(Module)";
-              }
-              // 强制我们的 instantiateWasm
-              m.instantiateWasm = instantiate;
-            } catch {}
-          }
-
-          // 显式等待 onRuntimeInitialized
-          let ready = false;
-          if (m && typeof m === "object") {
-            ready = await waitOnRuntimeInitialized(m, 20000);
-          }
-
-          // 记录探针信息
-          probe.push({
-            label: at.label,
-            note,
-            result: briefType(m),
-            keys: keysOf(m),
-            ready,
-          });
-
-          if (ready && m && typeof m.callMain === "function") {
-            php = m;
-            break;
-          }
-        } catch (e: any) {
-          probe.push({ label: at.label, error: e?.message || String(e) });
         }
-      }
 
-      if (url.pathname === "/__probe") {
         return new Response(JSON.stringify({
           dep: briefType(dep),
           depSize,
           attempts: probe,
           stderr,
+          hint: "当前构建很可能启用了 pthreads/PROXY_TO_PTHREAD，需改用单线程构建"
         }, null, 2), { headers: { "content-type": "application/json" } });
-      }
-
-      if (!php) {
-        return new Response(
-          "Runtime error: Emscripten init did not return expected Module.\n" +
-          JSON.stringify({ dep: briefType(dep), depSize, attempts: probe, stderr }, null, 2),
-          { status: 500, headers: { "content-type": "text/plain; charset=utf-8" } }
-        );
-      }
-
-      // 4) 执行 phpinfo()
-      try {
-        php.callMain(["-r", "phpinfo();"]);
       } catch (e: any) {
-        stderr.push("[callMain] " + (e?.message || String(e)));
+        return new Response("Runtime error: " + (e?.stack || e?.message || String(e)), {
+          status: 500, headers: { "content-type": "text/plain; charset=utf-8" }
+        });
       }
-
-      const body = stdout.length ? stdout.join("\n") : (stderr.length ? stderr.join("\n") : "No output");
-      const status = stdout.length ? 200 : (stderr.length ? 500 : 204);
-      return new Response(body, {
-        status,
-        headers: { "content-type": stdout.length ? "text/html; charset=utf-8" : "text/plain; charset=utf-8" }
-      });
-    } catch (e: any) {
-      return new Response("Runtime error: " + (e?.stack || e?.message || String(e)), {
-        status: 500,
-        headers: { "content-type": "text/plain; charset=utf-8" }
-      });
     }
+
+    // 根路径：直接提示需要单线程构建
+    return new Response(
+      "Need non-pthread build: current Emscripten module never reaches onRuntimeInitialized in Cloudflare Workers.\n" +
+      "请使用单线程构建（禁用 USE_PTHREADS/PROXY_TO_PTHREAD），然后再访问此路径运行 phpinfo()。",
+      { status: 503, headers: { "content-type": "text/plain; charset=utf-8" } }
+    );
   }
 };
