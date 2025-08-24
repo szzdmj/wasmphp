@@ -1,4 +1,5 @@
-// V24: 不再等待 onRuntimeInitialized；动态导入 + 规范化 wasm；深入自检 init 返回值与可用方法
+// V25: 带版本标记与诊断路由
+const VERSION = "V25-2025-08-24T09:57Z";
 
 async function normalizeWasmModule(wasmDefault: any): Promise<WebAssembly.Module> {
   if (wasmDefault && wasmDefault.constructor?.name === "Module") {
@@ -25,55 +26,62 @@ export default {
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
 
-    // 1) 仅诊断 .wasm 导入
+    if (url.pathname === "/__ver") {
+      return new Response(
+        JSON.stringify({ version: VERSION, now: new Date().toISOString() }),
+        { headers: { "content-type": "application/json; charset=utf-8", "x-version": VERSION } }
+      );
+    }
+
+    // 仅诊断 .wasm 导入
     if (url.pathname === "/__diag") {
       try {
         const wasmMod = await import("../scripts/php_8_4.wasm");
         const raw = (wasmMod as any).default;
         const normalized = await normalizeWasmModule(raw);
         return new Response(JSON.stringify({
+          version: VERSION,
           imported: !!raw,
           type: raw?.constructor?.name || typeof raw,
           normalized: normalized?.constructor?.name
-        }), { headers: { "content-type": "application/json; charset=utf-8" } });
+        }), { headers: { "content-type": "application/json; charset=utf-8", "x-version": VERSION } });
       } catch (e: any) {
-        return new Response(JSON.stringify({ imported: false, error: e?.message || String(e) }), {
+        return new Response(JSON.stringify({ version: VERSION, imported: false, error: e?.message || String(e) }), {
           status: 500,
-          headers: { "content-type": "application/json; charset=utf-8" }
+          headers: { "content-type": "application/json; charset=utf-8", "x-version": VERSION }
         });
       }
     }
 
-    // 2) 诊断 JS 模块导出
+    // 诊断 JS 模块导出
     if (url.pathname === "/__js") {
       try {
         const phpModule = await import("../scripts/php_8_4.js");
         const expKeys = firstKeys(phpModule);
         const def = (phpModule as any).default;
-        const defType = typeof def;
-        const defIsFunc = defType === "function";
         const init = (phpModule as any).init;
-        const initType = typeof init;
         return new Response(JSON.stringify({
+          version: VERSION,
           exportKeys: expKeys,
-          default: { type: defType, isFunction: defIsFunc, ctor: def?.constructor?.name || null, length: def?.length ?? null },
-          init: { type: initType, isFunction: initType === "function", length: init?.length ?? null }
-        }), { headers: { "content-type": "application/json; charset=utf-8" } });
+          default: { type: typeof def, isFunction: typeof def === "function", ctor: def?.constructor?.name || null, length: def?.length ?? null },
+          init: { type: typeof init, isFunction: typeof init === "function", length: init?.length ?? null }
+        }), { headers: { "content-type": "application/json; charset=utf-8", "x-version": VERSION } });
       } catch (e: any) {
-        return new Response(JSON.stringify({ error: "[import-js] " + (e?.message || String(e)) }), {
+        return new Response(JSON.stringify({ version: VERSION, error: "[import-js] " + (e?.message || String(e)) }), {
           status: 500,
-          headers: { "content-type": "application/json; charset=utf-8" }
+          headers: { "content-type": "application/json; charset=utf-8", "x-version": VERSION }
         });
       }
     }
 
+    // 初始化 PHP 仅在根路径
     const isPhpRoute = url.pathname === "/" || url.pathname === "/index.php";
     if (!isPhpRoute) {
-      return new Response("OK", { headers: { "content-type": "text/plain; charset=utf-8" } });
+      return new Response("OK", { headers: { "content-type": "text/plain; charset=utf-8", "x-version": VERSION } });
     }
 
     try {
-      // A) 导入 Emscripten JS
+      // A) 动态导入 JS
       const jsMod = await import("../scripts/php_8_4.js");
       const initCandidate =
         (jsMod as any).init ||
@@ -81,10 +89,13 @@ export default {
         (jsMod as any);
 
       if (typeof initCandidate !== "function") {
-        return new Response("Runtime error: PHP init function not found on module export", { status: 500 });
+        return new Response("Runtime error: PHP init function not found on module export", {
+          status: 500,
+          headers: { "content-type": "text/plain; charset=utf-8", "x-version": VERSION }
+        });
       }
 
-      // B) 导入并规范化 wasm Module
+      // B) 动态导入并规范化 wasm
       const wasmMod = await import("../scripts/php_8_4.wasm");
       const wasmModule = await normalizeWasmModule((wasmMod as any).default);
 
@@ -96,8 +107,6 @@ export default {
         print: (txt: string) => { try { stdout.push(String(txt)); } catch {} },
         printErr: (txt: string) => { try { stderr.push(String(txt)); } catch {} },
         onAbort: (reason: any) => { try { stderr.push("[abort] " + String(reason)); } catch {} },
-
-        // 同步实例化，完全绕开 fetch/URL
         instantiateWasm: (
           imports: WebAssembly.Imports,
           successCallback: (instance: WebAssembly.Instance) => void
@@ -108,18 +117,14 @@ export default {
         }
       };
 
-      // C) 初始化：支持两种签名；若返回 Promise，等待它
+      // C) 初始化（支持两种签名；若返回 Promise，等待）
       let initResult: any;
       try {
         initResult = (initCandidate as any)(moduleOptions);
-      } catch (e) {
-        // 一些构建要求第一个参数为环境标签
+      } catch {
         initResult = (initCandidate as any)("WORKER", moduleOptions);
       }
-
-      let php: any = initResult && typeof initResult.then === "function"
-        ? await initResult
-        : initResult;
+      const php: any = initResult && typeof initResult.then === "function" ? await initResult : initResult;
 
       // D) 自检返回对象
       const phpKeys = firstKeys(php);
@@ -127,14 +132,14 @@ export default {
       const hasCcall = php && typeof php.ccall === "function";
       const hasCwrap = php && typeof php.cwrap === "function";
 
-      // 提供一个调试路由，查看 keys
       if (url.pathname === "/__keys") {
         return new Response(JSON.stringify({
+          version: VERSION,
           typeofPhp: typeof php,
           ctor: php?.constructor?.name || null,
           keys: phpKeys,
           hasCallMain, hasCcall, hasCwrap
-        }), { headers: { "content-type": "application/json; charset=utf-8" } });
+        }), { headers: { "content-type": "application/json; charset=utf-8", "x-version": VERSION } });
       }
 
       if (!php || (!hasCallMain && !hasCcall && !hasCwrap)) {
@@ -144,18 +149,18 @@ export default {
           "keys=" + JSON.stringify(phpKeys)
         ].join("\n");
         console.error(msg);
-        return new Response(msg, { status: 500, headers: { "content-type": "text/plain; charset=utf-8" } });
+        return new Response(msg, { status: 500, headers: { "content-type": "text/plain; charset=utf-8", "x-version": VERSION } });
       }
 
-      // E) 运行 phpinfo（优先用 callMain；否则尝试 ccall）
+      // E) 尝试运行 phpinfo()
       try {
         if (hasCallMain) {
           php.callMain(["-r", "phpinfo();"]);
         } else if (hasCcall) {
-          // 退路：直接调用 main
-          php.ccall("main", "number", ["number", "number"], [2, 0]); // 参数形式可能不完全匹配，仅作为探针
+          // 退路：尝试直接 main（不保证参数完全匹配，仅作探针）
+          php.ccall("main", "number", ["number", "number"], [2, 0]);
         } else {
-          throw new Error("No callable entrypoint found (callMain/ccall)");
+          throw new Error("No callable entrypoint (callMain/ccall)");
         }
       } catch (e: any) {
         stderr.push("[call] " + (e?.message || String(e)));
@@ -165,14 +170,14 @@ export default {
       const status = stdout.length ? 200 : (stderr.length ? 500 : 204);
       return new Response(body, {
         status,
-        headers: { "content-type": stdout.length ? "text/html; charset=utf-8" : "text/plain; charset=utf-8" }
+        headers: { "content-type": stdout.length ? "text/html; charset=utf-8" : "text/plain; charset=utf-8", "x-version": VERSION }
       });
     } catch (e: any) {
       const msg = e?.stack || e?.message || String(e);
       console.error("[top] " + msg);
       return new Response("Runtime error: " + msg, {
         status: 500,
-        headers: { "content-type": "text/plain; charset=utf-8" }
+        headers: { "content-type": "text/plain; charset=utf-8", "x-version": VERSION }
       });
     }
   }
