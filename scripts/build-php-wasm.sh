@@ -26,12 +26,12 @@ if [ ! -d "${PHP_DIR}" ]; then
     curl -fsSL "${TARBALL_URL}" -o "${TARBALL}"
     echo "[*] Extracting tarball..."
     tar -xzf "${TARBALL}" -C "${SRC_PARENT}"
-    # The tarball extracts to php-X.Y.Z, move/rename to php-src
-    EXTRACT_DIR="${SRC_PARENT}/${PHP_REF/php-/php-}"
+    # Tarball directory is like vendor/php-8.4.0
+    EXTRACT_DIR="${SRC_PARENT}/${PHP_REF}"
     if [ ! -d "${EXTRACT_DIR}" ]; then
-      # Fallback: try without 'php-' prefix mismatch
-      EXTRACT_DIR_GLOB="$(echo ${SRC_PARENT}/php-*/)"
-      EXTRACT_DIR="${EXTRACT_DIR_GLOB%/}"
+      # Fallback: guess from glob
+      EXTRACT_DIR="$(ls -d ${SRC_PARENT}/php-*/ | head -n1)"
+      EXTRACT_DIR="${EXTRACT_DIR%/}"
     fi
     mv "${EXTRACT_DIR}" "${PHP_DIR}"
   else
@@ -237,8 +237,9 @@ BUILD_TRIPLE="$(/bin/sh build/config.guess || echo x86_64-pc-linux-gnu)"
 
 # Build flags
 COMMON_EM_FLAGS='-s EXIT_RUNTIME=0 -s ERROR_ON_UNDEFINED_SYMBOLS=0 -s WASM=1 -s MODULARIZE=1 -s EXPORT_ES6=1 -s ENVIRONMENT=worker -s ALLOW_MEMORY_GROWTH=1 -s FILESYSTEM=1'
-# Force-include the syslog compat header so LOG_* constants always exist.
-CPPFLAGS_IN="${EMCC_CPPFLAGS:-} -DPCRE2_CODE_UNIT_WIDTH=8 -DPCRE2_DISABLE_JIT -DSUPPORT_JIT=0 -DHAVE_PCRE_JIT=0 -DSLJIT_CONFIG_UNSUPPORTED=1 -include main/php_wasm_syslog_compat.h"
+# Use absolute path for the forced-include header so it works in all subdirs
+SYSLOG_COMPAT_ABS="${PWD}/main/php_wasm_syslog_compat.h"
+CPPFLAGS_IN="${EMCC_CPPFLAGS:-} -DPCRE2_CODE_UNIT_WIDTH=8 -DPCRE2_DISABLE_JIT -DSUPPORT_JIT=0 -DHAVE_PCRE_JIT=0 -DSLJIT_CONFIG_UNSUPPORTED=1 -include ${SYSLOG_COMPAT_ABS}"
 CFLAGS_IN="${EMCC_CFLAGS:- -O3}"
 LDFLAGS_IN="${EMCC_LDFLAGS:-} ${COMMON_EM_FLAGS}"
 
@@ -282,9 +283,8 @@ EC=${PIPESTATUS[0]}
 set +o pipefail
 if [ ${EC} -ne 0 ]; then
   echo "[-] Build failed. Showing relevant compiler errors from build.log:"
-  # Try to surface the real cause: compiler errors or missing generators
   { 
-    grep -nE "(/emscripten/em(cc|\+\+)| error: |: error:|No such file or directory|command not found|bison|re2c)" "${OUT_DIR}/build.log" | tail -n 200;
+    grep -nE "(/emscripten/em(cc|\+\+)| error: |: error:|No such file or directory|command not found|bison|re2c|php_wasm_syslog_compat.h)" "${OUT_DIR}/build.log" | tail -n 200;
     echo "---- tail of build.log (last 400 lines) ----";
     tail -n 400 "${OUT_DIR}/build.log";
   } || true
