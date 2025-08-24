@@ -1,8 +1,4 @@
-// Production-ready minimal worker for PHP Wasm on Cloudflare Workers.
-// - 动态导入 Emscripten JS 和 .wasm，所有异常都在请求内捕获，避免 1101
-// - 使用 instantiateWasm 同步实例化（无需 fetch/URL/内联大字节）
-// - 兼容两种 Emscripten init 签名：init(options) 与 init("WORKER", options)
-// - 仅执行 phpinfo() 作为示例，后续可改为执行用户脚本
+// V27: 兼容多种 Emscripten init 签名，优先使用 init(dependencyFilename, options)
 
 async function normalizeWasmModule(wasmDefault: any): Promise<WebAssembly.Module> {
   if (wasmDefault && wasmDefault.constructor?.name === "Module") {
@@ -21,21 +17,19 @@ export default {
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
 
-    // 仅在根路径运行 PHP；其它路径返回健康检查
+    // 非根路径直接健康检查
     if (!(url.pathname === "/" || url.pathname === "/index.php")) {
       return new Response("OK", { headers: { "content-type": "text/plain; charset=utf-8" } });
     }
 
     try {
-      // 1) 动态导入 Emscripten JS
+      // 1) 动态导入 JS（拿到 init 和 dependencyFilename）
       const jsMod = await import("../scripts/php_8_4.js");
-      const initCandidate =
-        (jsMod as any).init ||
-        (jsMod as any).default ||
-        (jsMod as any);
+      const init: any = (jsMod as any).init;
+      const dep: any = (jsMod as any).dependencyFilename;
 
-      if (typeof initCandidate !== "function") {
-        return new Response("Runtime error: PHP init function not found in module exports", {
+      if (typeof init !== "function") {
+        return new Response("Runtime error: export 'init' not found or not a function", {
           status: 500,
           headers: { "content-type": "text/plain; charset=utf-8" }
         });
@@ -45,48 +39,63 @@ export default {
       const wasmMod = await import("../scripts/php_8_4.wasm");
       const wasmModule = await normalizeWasmModule((wasmMod as any).default);
 
-      // 3) 设置 Emscripten 选项
+      // 3) Emscripten 选项（同步实例化，避免 fetch/URL）
       const stdout: string[] = [];
       const stderr: string[] = [];
-
       const moduleOptions: any = {
         noInitialRun: true,
         print: (txt: string) => { try { stdout.push(String(txt)); } catch {} },
         printErr: (txt: string) => { try { stderr.push(String(txt)); } catch {} },
         onAbort: (reason: any) => { try { stderr.push("[abort] " + String(reason)); } catch {} },
-
-        // 核心：同步实例化，避免 fetch/URL/内联大字节
         instantiateWasm: (
           imports: WebAssembly.Imports,
           successCallback: (instance: WebAssembly.Instance) => void
         ) => {
           const instance = new WebAssembly.Instance(wasmModule, imports);
           successCallback(instance);
-          return instance.exports as any; // Emscripten 需要返回 exports
-        }
+          return instance.exports as any;
+        },
       };
 
-      // 4) 初始化（兼容两种签名；若返回 Promise，等待）
-      let initResult: any;
-      try {
-        initResult = (initCandidate as any)(moduleOptions);
-      } catch {
-        // 你的构建导出了 init(length=2)，通常是 (tag, options)
-        initResult = (initCandidate as any)("WORKER", moduleOptions);
+      // 4) 依次尝试几种已知签名
+      const attempts: Array<() => any> = [
+        () => init(dep, moduleOptions),                                  // 常见：init(wasmUrl, options)
+        () => init(moduleOptions),                                       // Emscripten MODULARIZE 常见：init(options)
+        () => init("WORKER", moduleOptions),                             // 某些构建：init(tag, options)
+        () => init({ ...moduleOptions, locateFile: () => String(dep) }), // 通过 locateFile 提供 wasm 路径
+      ];
+
+      let php: any = undefined;
+      const attemptErrors: string[] = [];
+      for (const fn of attempts) {
+        try {
+          const res = fn();
+          php = (res && typeof res.then === "function") ? await res : res;
+          if (php && typeof php.callMain === "function") break;
+        } catch (e: any) {
+          attemptErrors.push(e?.message || String(e));
+          php = undefined;
+        }
       }
-      const php: any = initResult && typeof initResult.then === "function" ? await initResult : initResult;
+
+      if (!php || typeof php.callMain !== "function") {
+        // 回显我们尝试过的方法，便于进一步定位
+        const info = {
+          depType: typeof dep,
+          hasDep: !!dep,
+          depCtor: (dep as any)?.constructor?.name || null,
+          attempts: attemptErrors,
+          phpType: typeof php,
+          phpCtor: php?.constructor?.name || null,
+          phpKeys: (() => { try { return Object.keys(php || {}); } catch { return []; } })(),
+        };
+        return new Response(
+          "Runtime error: Emscripten init did not return expected Module.\n" + JSON.stringify(info, null, 2),
+          { status: 500, headers: { "content-type": "text/plain; charset=utf-8" } }
+        );
+      }
 
       // 5) 执行 phpinfo()
-      if (!php || typeof php.callMain !== "function") {
-        const keys = (() => { try { return Object.keys(php || {}); } catch { return []; } })();
-        const msg = [
-          "Runtime error: Emscripten init did not return expected Module.",
-          "typeof php=" + (typeof php) + ", ctor=" + (php?.constructor?.name || "null"),
-          "keys=" + JSON.stringify(keys)
-        ].join("\n");
-        return new Response(msg, { status: 500, headers: { "content-type": "text/plain; charset=utf-8" } });
-      }
-
       try {
         php.callMain(["-r", "phpinfo();"]);
       } catch (e: any) {
