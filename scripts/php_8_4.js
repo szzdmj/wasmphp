@@ -19,7 +19,9 @@ export async function init(RuntimeName, PHPLoader) {
     // FIX: instantiateWasm 必须是同步签名，且返回 exports 或空对象（回调路径）
     Module.instantiateWasm = function(importObject, successCallback) {
       try {
-        const bin = Module["wasmBinary"];
+  Module["wasmBinary"] = Module["wasmBinary"] || dependencyFilename;
+  // 你已有的 instantiateWasm 修正...
+  Module.instantiateWasm = function(importObject, successCallback) { /* ... */ };
 
         // 1) 绑定为已编译的 WebAssembly.Module（wrangler wasm_modules 注入的典型形态）
         if (typeof WebAssembly !== "undefined" && bin instanceof WebAssembly.Module) {
@@ -108,10 +110,20 @@ export async function init(RuntimeName, PHPLoader) {
             this.status = status;
         }
     };
+
+  // 注意：把下面这段放在 addOnPostRun 定义之后（通常 Emscripten 会先有：var onPostRuns=[]; var addOnPostRun=...）
+  if (typeof addOnPostRun === 'function') {
 addOnPostRun(() => {
   PHPLoader.malloc = Module._malloc || (Module.cwrap && Module.cwrap('malloc', 'number', ['number']));
   PHPLoader.free = Module._free || (Module.cwrap && Module.cwrap('free', null, ['number'])) || PHPLoader._wasm_free;
 });
+  } else {
+    // 兼容：如果你当前片段位置还没定义 addOnPostRun，就用 onRuntimeInitialized 兜底
+    Module.onRuntimeInitialized = () => {
+      PHPLoader.malloc = Module._malloc || (Module.cwrap && Module.cwrap('malloc', 'number', ['number']));
+      PHPLoader.free = Module._free || (Module.cwrap && Module.cwrap('free', null, ['number'])) || PHPLoader._wasm_free;
+    };
+  }
 
     return PHPLoader;
 }
