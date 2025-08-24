@@ -18,23 +18,43 @@ export default {
     const stderr: string[] = [];
 
     try {
-      // Initialize PHP for this request so we can capture output deterministically
-      const php = await initPHP("WORKER", {
+      // Ensure runtime is ready before using FS
+      let resolveReady: () => void;
+      const runtimeReady = new Promise<void>((res) => { resolveReady = res; });
+
+      const php: any = await initPHP("WORKER", {
         wasmBinary,
         print: (txt: string) => stdout.push(String(txt)),
         printErr: (txt: string) => stderr.push(String(txt)),
+        noInitialRun: true,
+        onRuntimeInitialized: () => resolveReady!(),
       });
 
-      // Prepare VFS and write /public/index.php
-      try { php.FS.mkdir("/public"); } catch {}
-      php.FS.writeFile("/public/index.php", indexPhpSource);
+      // Wait for the Emscripten runtime to be ready
+      await runtimeReady;
 
-      // Execute: php /public/index.php
-      try {
-        php.callMain(["/public/index.php"]);
-      } catch (e: any) {
-        // Some builds throw ExitStatus on non-zero exit; log to stderr for troubleshooting
-        if (e?.message) stderr.push(e.message);
+      // Prefer Module FS, fall back to global FS if the build doesn't attach it to the module
+      const FS = (php as any)?.FS || (globalThis as any)?.FS;
+
+      if (FS && typeof FS.writeFile === "function") {
+        // Prepare VFS and write /public/index.php
+        try { FS.mkdir("/public"); } catch {}
+        FS.writeFile("/public/index.php", indexPhpSource);
+
+        // Execute: php /public/index.php
+        try {
+          php.callMain(["/public/index.php"]);
+        } catch (e: any) {
+          // Some builds throw ExitStatus on non-zero exit; log to stderr for troubleshooting
+          if (e?.message) stderr.push(e.message);
+        }
+      } else {
+        // Fallback path: run phpinfo() without FS dependency
+        try {
+          php.callMain(["-r", "phpinfo();"]);
+        } catch (e: any) {
+          if (e?.message) stderr.push(e.message);
+        }
       }
 
       const body = stdout.length ? stdout.join("\n") : (stderr.length ? stderr.join("\n") : "");
