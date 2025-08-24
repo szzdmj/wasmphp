@@ -1,28 +1,10 @@
-// 最小增量：
-// - 保持原有逻辑与错误复现（locateFile 使用 import.meta.url，根路径仍会报错，便于对照）
-// - 仅新增 /scripts/php_8_4.wasm 路由，将 GitHub raw 的 wasm 反代到同源
-// - 保持现有 /__probe（按你的实现返回 resolvedWasmURL / fetchStatus / fetchHeaders / fetchError）
-
-import createPHP from '../scripts/php_8_4.js';
-
-// 如需锁定版本，可将 main 换成具体 commit SHA，便于稳定复现
-const WASM_UPSTREAM =
-  'https://raw.githubusercontent.com/szzdmj/wasmphp/main/scripts/php_8_4.wasm';
-
-export default {
-  async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-
-    // 健康检查（若你已有此路由，可保留/删除）
-    if (url.pathname === '/health') {
-      return new Response('ok', { headers: { 'content-type': 'text/plain' } });
-    }
-
-    // 新增：反代同源提供 wasm，供 /__probe 与后续基于 origin 的 locateFile 验证使用
+// 将仓库中的 wasm 反代为同源路径，供 locateFile/probe 使用
     if (url.pathname === '/scripts/php_8_4.wasm') {
-      const res = await fetch(WASM_UPSTREAM, {
-        // @ts-ignore 启用 CF 边缘缓存（可选）
-        cf: { cacheTtl: 300, cacheEverything: true },
+  // 建议锁定为固定 commit，便于稳定复现；先用 main 测通再锁定
+  const upstream = 'https://raw.githubusercontent.com/szzdmj/wasmphp/main/scripts/php_8_4.wasm';
+  const res = await fetch(upstream, {
+    // @ts-ignore Cloudflare 缓存（可选）
+    cf: { cacheTtl: 300, cacheEverything: true }
       });
       if (!res.ok) {
         return new Response(`Upstream wasm fetch failed: ${res.status}`, { status: 502 });
