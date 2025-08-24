@@ -237,13 +237,16 @@ BUILD_TRIPLE="$(/bin/sh build/config.guess || echo x86_64-pc-linux-gnu)"
 
 # Build flags
 COMMON_EM_FLAGS='-s EXIT_RUNTIME=0 -s ERROR_ON_UNDEFINED_SYMBOLS=0 -s WASM=1 -s MODULARIZE=1 -s EXPORT_ES6=1 -s ENVIRONMENT=worker -s ALLOW_MEMORY_GROWTH=1 -s FILESYSTEM=1'
+
 # Use absolute path for the forced-include header so it works in all subdirs
 SYSLOG_COMPAT_ABS="${PWD}/main/php_wasm_syslog_compat.h"
-CPPFLAGS_IN="${EMCC_CPPFLAGS:-} -DPCRE2_CODE_UNIT_WIDTH=8 -DPCRE2_DISABLE_JIT -DSUPPORT_JIT=0 -DHAVE_PCRE_JIT=0 -DSLJIT_CONFIG_UNSUPPORTED=1 -include ${SYSLOG_COMPAT_ABS}"
+
+# Force-disable PS_USE_SETPROCTITLE and provide other CPP flags
+CPPFLAGS_IN="${EMCC_CPPFLAGS:-} -DPCRE2_CODE_UNIT_WIDTH=8 -DPCRE2_DISABLE_JIT -DSUPPORT_JIT=0 -DHAVE_PCRE_JIT=0 -DSLJIT_CONFIG_UNSUPPORTED=1 -DPS_USE_SETPROCTITLE=0 -include ${SYSLOG_COMPAT_ABS}"
 CFLAGS_IN="${EMCC_CFLAGS:- -O3}"
 LDFLAGS_IN="${EMCC_LDFLAGS:-} ${COMMON_EM_FLAGS}"
 
-# Hint autoconf to avoid selecting syslog and dns paths (double insurance)
+# Hint autoconf to avoid selecting syslog, dns, and setproctitle paths (double insurance)
 export ac_cv_func_dns_search=no
 export ac_cv_func_dns_open=no
 export ac_cv_func_dns_free=no
@@ -252,6 +255,7 @@ export ac_cv_func_res_ndestroy=no
 export ac_cv_header_syslog_h=no
 export ac_cv_func_syslog=no
 export ac_cv_func_vsyslog=no
+export ac_cv_func_setproctitle=no
 
 echo "[*] emconfigure ./configure ..."
 set +e
@@ -284,7 +288,7 @@ set +o pipefail
 if [ ${EC} -ne 0 ]; then
   echo "[-] Build failed. Showing relevant compiler errors from build.log:"
   { 
-    grep -nE "(/emscripten/em(cc|\+\+)| error: |: error:|No such file or directory|command not found|bison|re2c|php_wasm_syslog_compat.h)" "${OUT_DIR}/build.log" | tail -n 200;
+    grep -nE "(/emscripten/em(cc|\+\+)| error: |: error:|No such file or directory|command not found|bison|re2c|php_wasm_syslog_compat.h|setproctitle|ps_title\\.c)" "${OUT_DIR}/build.log" | tail -n 200;
     echo "---- tail of build.log (last 400 lines) ----";
     tail -n 400 "${OUT_DIR}/build.log";
   } || true
