@@ -1,18 +1,17 @@
-// 保持“早上的代码状态”：主路径仍使用 import.meta.url 的 locateFile（便于复现当前错误）。
-// 仅做最小增量：
-// 1) 新增 /scripts/php_8_4.wasm 路由：把 GitHub raw 的 wasm 反代到同源，便于同源访问与探测。
-// 2) 新增 /__probe 探针：检查 import.meta.url 可用性、两种候选 wasm URL 及各自抓取结果。
+// 保持“早上的代码状态”：主路径仍使用 import.meta.url 的 locateFile（方便复现当前错误）。
+// 最小增量：
+// 1) 新增 /scripts/php_8_4.wasm 路由，把 GitHub raw 的 wasm 反代到同源，供探针与后续切换使用；
+// 2) 新增 /__probe 探针，显示 import.meta.url 可用性、两种候选 wasm URL 及抓取结果；
 // 3) 新增 /health 健康检查。
-// 注意：这版不会改变你主路径的行为（依旧会因为 import.meta.url 在 Worker 环境下不可用而报错），
+// 注意：这版不会改变主路径行为（依旧可能因 import.meta.url 在 Worker 环境下不可用而报错），
 // 目的是先把探针打通，再按你的节奏逐句修正。
 
 import createPHP from '../scripts/php_8_4.js';
 
-// 如需锁定版本，可将 main 替换为固定 commit SHA 以便稳定复现
+// 如需锁定版本，可将 main 替换为固定 commit SHA 以稳定复现
 const WASM_UPSTREAM =
   'https://raw.githubusercontent.com/szzdmj/wasmphp/main/scripts/php_8_4.wasm';
 
-// 探针用的小工具函数：尝试抓取某个 URL，返回状态/类型/长度/错误
 async function tryFetch(urlStr: string): Promise<{
   ok: boolean;
   status: number;
@@ -53,7 +52,7 @@ export default {
     if (url.pathname === '/scripts/php_8_4.wasm') {
       const upstream = WASM_UPSTREAM;
       const res = await fetch(upstream, {
-        // @ts-ignore Cloudflare 缓存（可选）
+        // @ts-ignore 启用 Cloudflare 边缘缓存（可选）
         cf: { cacheTtl: 300, cacheEverything: true },
       });
       if (!res.ok) {
@@ -72,7 +71,7 @@ export default {
     if (url.pathname === '/__probe') {
       let importMetaUrl: string | null = null;
       try {
-        // 在部分环境中 import.meta 可能存在但无 url 属性；这里用可选链避免抛错
+        // 某些环境 import.meta 存在但无 url；用可选链避免抛错
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         importMetaUrl = (import.meta as any)?.url ?? null;
       } catch {
@@ -126,7 +125,7 @@ export default {
     let out = '';
     try {
       const php = await createPHP({
-        // 原始写法：基于 import.meta.url 计算 wasm 位置（当前错误就发生在这里）
+        // 原始写法：基于 import.meta.url 计算 wasm 位置（错误就发生在这里）
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         locateFile: (p: string) => new URL(`../scripts/${p}`, (import.meta as any).url).href,
         print: (txt: string) => {
