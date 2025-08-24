@@ -21,6 +21,24 @@ cd "${PHP_DIR}"
 echo "[*] Running buildconf..."
 ./buildconf --force
 
+# Pre-patch: hard-disable PCRE2 JIT by stubbing JIT sources.
+# This avoids build errors even if Makefile still lists pcre2_jit_*.
+echo "[*] Stubbing PCRE2 JIT sources for WASM..."
+for f in \
+  ext/pcre/pcre2lib/pcre2_jit_compile.c \
+  ext/pcre/pcre2lib/pcre2_jit_match.c
+do
+  if [ -f "$f" ] && [ ! -f "$f.upstream" ]; then
+    echo "  - Replacing $f with a no-op stub"
+    mv "$f" "$f.upstream"
+    cat > "$f" <<'EOF'
+/* WASM build: JIT disabled, provide empty translation unit. */
+#define PCRE2_CODE_UNIT_WIDTH 8
+void __pcre2_wasm_nojit_stub(void) {}
+EOF
+  fi
+done
+
 # Cross triples
 HOST_TRIPLE="wasm32-unknown-emscripten"
 BUILD_TRIPLE="$(/bin/sh build/config.guess || echo x86_64-pc-linux-gnu)"
@@ -53,38 +71,11 @@ if [ $CFG_RC -ne 0 ]; then
   exit $CFG_RC
 fi
 
-# Aggressively strip PCRE2 JIT/sljit objects from Makefiles (token-level replace).
-echo "[*] Stripping PCRE2 JIT/sljit objects from Makefiles..."
-for f in Makefile Makefile.objects ext/pcre/Makefile; do
-  [ -f "$f" ] || continue
-  # Remove pcre2_jit_* objects (both .lo and .o) even if they appear in long variable lists
-  sed -i -E 's:([[:space:]]|\\|^)ext/pcre/pcre2lib/pcre2_jit_(compile|match)\.(lo|o)([[:space:]]|\\|$):\1:g' "$f" || true
-  sed -i -E 's:([[:space:]]|\\|^)pcre2_jit_(compile|match)\.(lo|o)([[:space:]]|\\|$):\1:g' "$f" || true
-  # Remove any sljit/*.lo occurrences
-  sed -i -E 's:([[:space:]]|\\|^)ext/pcre/pcre2lib/sljit/[^[:space:]\\]+\.lo([[:space:]]|\\|$):\1:g' "$f" || true
-  sed -i -E 's:([[:space:]]|\\|^)sljit/[^[:space:]\\]+\.lo([[:space:]]|\\|$):\1:g' "$f" || true
-done
-
-# Report leftovers but do not fail (macros should still guard compilation)
-LEFT=""
-for f in Makefile Makefile.objects ext/pcre/Makefile; do
-  [ -f "$f" ] || continue
-  if grep -qE 'pcre2_jit_(compile|match)\.(lo|o)|(^|[[:space:]])sljit/|/sljit([^[:alnum:]_]|$)' "$f"; then
-    LEFT="${LEFT} $f"
-  fi
-done
-if [ -n "${LEFT}" ]; then
-  echo "[!] Warning: JIT/sljit references still present in:${LEFT}"
-  echo "    Proceeding with SLJIT_CONFIG_UNSUPPORTED=1 and PCRE2_DISABLE_JIT macros."
-else
-  echo "[*] JIT/sljit references seem removed from Makefiles."
-fi
-
 # Compile with low parallelism for clearer logs
 JOBS="${JOBS:-1}"
 echo "[*] emmake make -j${JOBS} V=1 ..."
 emmake make -j"${JOBS}" V=1 || {
-  echo "[-] Build failed. Try JOBS=1 and ensure JIT is effectively disabled."
+  echo "[-] Build failed. Try JOBS=1 and ensure JIT is disabled."
   exit 1
 }
 
