@@ -21,23 +21,33 @@ cd "${PHP_DIR}"
 echo "[*] Running buildconf..."
 ./buildconf --force
 
-# Pre-patch: hard-disable PCRE2 JIT by stubbing JIT sources.
-# This avoids build errors even if Makefile still lists pcre2_jit_*.
-echo "[*] Stubbing PCRE2 JIT sources for WASM..."
-for f in \
-  ext/pcre/pcre2lib/pcre2_jit_compile.c \
-  ext/pcre/pcre2lib/pcre2_jit_match.c
-do
-  if [ -f "$f" ] && [ ! -f "$f.upstream" ]; then
-    echo "  - Replacing $f with a no-op stub"
-    mv "$f" "$f.upstream"
-    cat > "$f" <<'EOF'
-/* WASM build: JIT disabled, provide empty translation unit. */
+# Pre-patch: hard-disable PCRE2 JIT by stubbing all JIT and sljit sources.
+echo "[*] Stubbing PCRE2 JIT sources for WASM (pcre2_jit_*.c and sljit/*.c)..."
+STUB_COUNT=0
+# 1) Stub any pcre2_jit_*.c files
+while IFS= read -r -d '' f; do
+  if [ ! -f "${f}.upstream" ]; then mv "$f" "${f}.upstream"; fi
+  cat > "$f" <<'EOF'
+/* WASM build: PCRE2 JIT disabled, empty translation unit */
 #define PCRE2_CODE_UNIT_WIDTH 8
 void __pcre2_wasm_nojit_stub(void) {}
 EOF
-  fi
-done
+  echo "  - stubbed: $f"
+  STUB_COUNT=$((STUB_COUNT+1))
+done < <(find ext -type f -name 'pcre2_jit_*.c' -print0 2>/dev/null)
+
+# 2) Stub any sljit/*.c files to avoid arch-specific JIT code
+while IFS= read -r -d '' f; do
+  if [ ! -f "${f}.upstream" ]; then mv "$f" "${f}.upstream"; fi
+  cat > "$f" <<'EOF'
+/* WASM build: SLJIT disabled for PCRE2 JIT, empty translation unit */
+void __sljit_wasm_nojit_stub(void) {}
+EOF
+  echo "  - stubbed: $f"
+  STUB_COUNT=$((STUB_COUNT+1))
+done < <(find ext -type f -path '*/sljit/*.c' -print0 2>/dev/null)
+
+echo "[*] Total stubbed files: ${STUB_COUNT}"
 
 # Cross triples
 HOST_TRIPLE="wasm32-unknown-emscripten"
@@ -45,7 +55,7 @@ BUILD_TRIPLE="$(/bin/sh build/config.guess || echo x86_64-pc-linux-gnu)"
 
 # Build flags
 # - Disable PCRE2 JIT in multiple ways (configure + macros)
-# - Single-thread, ES6 module, Worker, allow memory growth
+# - Single-thread, ES6 module, Worker, allow memory growth, FS on
 COMMON_EM_FLAGS='-s EXIT_RUNTIME=0 -s ERROR_ON_UNDEFINED_SYMBOLS=0 -s WASM=1 -s MODULARIZE=1 -s EXPORT_ES6=1 -s ENVIRONMENT=worker -s ALLOW_MEMORY_GROWTH=1 -s FILESYSTEM=1'
 CPPFLAGS_IN="${EMCC_CPPFLAGS:-} -DPCRE2_CODE_UNIT_WIDTH=8 -DPCRE2_DISABLE_JIT -DSUPPORT_JIT=0 -DHAVE_PCRE_JIT=0 -DSLJIT_CONFIG_UNSUPPORTED=1"
 CFLAGS_IN="${EMCC_CFLAGS:- -O3}"
@@ -59,6 +69,7 @@ emconfigure ./configure \
   --disable-all \
   --enable-cli \
   --disable-zts \
+  --disable-opcache \
   --without-pear \
   --with-pcre-jit=no \
   CPPFLAGS="${CPPFLAGS_IN}" CFLAGS="${CFLAGS_IN}" LDFLAGS="${LDFLAGS_IN}"
@@ -75,7 +86,9 @@ fi
 JOBS="${JOBS:-1}"
 echo "[*] emmake make -j${JOBS} V=1 ..."
 emmake make -j"${JOBS}" V=1 || {
-  echo "[-] Build failed. Try JOBS=1 and ensure JIT is disabled."
+  echo "[-] Build failed. Showing last errors..."
+  # Try to print last compiler error lines if available
+  grep -RIn --color=never -E "error:|undefined reference|was not declared" . | tail -n 200 || true
   exit 1
 }
 
