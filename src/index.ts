@@ -1,20 +1,17 @@
-export interface Env {
-  PHP_WASM: WebAssembly.Module;
-}
+import phpWasm from "../scripts/php_8_4.wasm"; // 关键：ESM 直接 import .wasm（Wrangler 会预编译为 WebAssembly.Module）
+
+export interface Env {}
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, _env: Env): Promise<Response> {
     try {
       const url = new URL(request.url);
 
-      // 调试路由：快速检查 PHP_WASM 是否已绑定
+      // 诊断路由：检查导入的 wasm 是否是 WebAssembly.Module
       if (url.pathname === "/__diag") {
-        const ok = env && typeof env.PHP_WASM === "object";
+        const ok = phpWasm && (phpWasm as any).constructor?.name === "Module";
         return new Response(
-          JSON.stringify({
-            hasPHP_WASM: ok,
-            type: ok ? (env.PHP_WASM as any)?.constructor?.name : null
-          }),
+          JSON.stringify({ hasPHP_WASM: ok, type: (phpWasm as any)?.constructor?.name || null }),
           { headers: { "content-type": "application/json; charset=utf-8" } }
         );
       }
@@ -26,7 +23,7 @@ export default {
         });
       }
 
-      // 仅动态导入 Emscripten JS，任何顶层异常会以 Promise 形式被 try/catch 捕获
+      // 动态导入 Emscripten JS（避免顶层异常变成 1101）
       const phpModule = await import("../scripts/php_8_4.js");
       const initCandidate =
         (phpModule as any).init ||
@@ -35,13 +32,6 @@ export default {
 
       if (typeof initCandidate !== "function") {
         return new Response("Runtime error: PHP init function not found on module export", {
-          status: 500,
-          headers: { "content-type": "text/plain; charset=utf-8" }
-        });
-      }
-
-      if (!env?.PHP_WASM) {
-        return new Response("Runtime error: env.PHP_WASM is not bound. Check wrangler.jsonc wasm_modules.", {
           status: 500,
           headers: { "content-type": "text/plain; charset=utf-8" }
         });
@@ -60,11 +50,11 @@ export default {
         onRuntimeInitialized: () => { try { resolveReady(); } catch {} },
         onAbort: (reason: any) => { try { stderr.push("[abort] " + String(reason)); } catch {} },
 
-        // 核心：使用 Cloudflare 注入的 WebAssembly.Module，避免 fetch/内联字节
+        // 核心：用 Wrangler 预编译好的 WebAssembly.Module 同步实例化，避免 fetch/URL/内联巨型字节
         instantiateWasm: (imports: WebAssembly.Imports, successCallback: (instance: WebAssembly.Instance) => void) => {
-          const instance = new WebAssembly.Instance(env.PHP_WASM, imports);
+          const instance = new WebAssembly.Instance(phpWasm as unknown as WebAssembly.Module, imports);
           successCallback(instance);
-          return (instance.exports as any);
+          return instance.exports as any; // Emscripten 需要返回 exports
         },
       };
 
