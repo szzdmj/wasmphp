@@ -1,45 +1,60 @@
-// V27: 兼容多种 Emscripten init 签名，优先使用 init(dependencyFilename, options)
+// V28: 穷举 init 签名，自动识别返回值（Promise/Function/Module），并记录探测结果
 
 async function normalizeWasmModule(wasmDefault: any): Promise<WebAssembly.Module> {
-  if (wasmDefault && wasmDefault.constructor?.name === "Module") {
-    return wasmDefault as WebAssembly.Module;
-  }
+  if (wasmDefault && wasmDefault.constructor?.name === "Module") return wasmDefault as WebAssembly.Module;
   const bytes: ArrayBuffer | null =
     wasmDefault instanceof ArrayBuffer
       ? wasmDefault
       : (ArrayBuffer.isView(wasmDefault) ? (wasmDefault as ArrayBufferView).buffer : null);
-
   if (bytes) return await WebAssembly.compile(bytes);
   throw new Error("Unsupported wasm default export type: " + (wasmDefault?.constructor?.name || typeof wasmDefault));
 }
+
+function briefType(v: any) {
+  const t = typeof v;
+  const ctor = v?.constructor?.name || null;
+  return { type: t, ctor, isFunction: t === "function", isPromise: !!v && typeof v.then === "function" };
+}
+
+function keysOf(v: any, max = 50) { try { return Object.keys(v || {}).slice(0, max); } catch { return []; } }
 
 export default {
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
 
-    // 非根路径直接健康检查
-    if (!(url.pathname === "/" || url.pathname === "/index.php")) {
+    // 健康检查
+    if (url.pathname === "/__ping") return new Response("pong");
+
+    // 探测导出信息
+    if (url.pathname === "/__jsplus") {
+      const jsMod = await import("../scripts/php_8_4.js");
+      return new Response(JSON.stringify({
+        exportKeys: keysOf(jsMod),
+        dependencyFilename: briefType((jsMod as any).dependencyFilename),
+        dependenciesTotalSize: (jsMod as any).dependenciesTotalSize ?? null,
+        init: briefType((jsMod as any).init),
+      }), { headers: { "content-type": "application/json" } });
+    }
+
+    // 仅根路径执行
+    if (!(url.pathname === "/" || url.pathname === "/index.php" || url.pathname === "/__probe")) {
       return new Response("OK", { headers: { "content-type": "text/plain; charset=utf-8" } });
     }
 
     try {
-      // 1) 动态导入 JS（拿到 init 和 dependencyFilename）
+      // 1) 导入 JS & WASM
       const jsMod = await import("../scripts/php_8_4.js");
       const init: any = (jsMod as any).init;
       const dep: any = (jsMod as any).dependencyFilename;
-
+      const depSize: any = (jsMod as any).dependenciesTotalSize;
       if (typeof init !== "function") {
-        return new Response("Runtime error: export 'init' not found or not a function", {
-          status: 500,
-          headers: { "content-type": "text/plain; charset=utf-8" }
-        });
+        return new Response("Runtime error: export 'init' not found or not a function", { status: 500 });
       }
 
-      // 2) 动态导入并规范化 .wasm
       const wasmMod = await import("../scripts/php_8_4.wasm");
       const wasmModule = await normalizeWasmModule((wasmMod as any).default);
 
-      // 3) Emscripten 选项（同步实例化，避免 fetch/URL）
+      // 2) Emscripten 选项
       const stdout: string[] = [];
       const stderr: string[] = [];
       const moduleOptions: any = {
@@ -47,55 +62,75 @@ export default {
         print: (txt: string) => { try { stdout.push(String(txt)); } catch {} },
         printErr: (txt: string) => { try { stderr.push(String(txt)); } catch {} },
         onAbort: (reason: any) => { try { stderr.push("[abort] " + String(reason)); } catch {} },
-        instantiateWasm: (
-          imports: WebAssembly.Imports,
-          successCallback: (instance: WebAssembly.Instance) => void
-        ) => {
+        locateFile: (path: string, base?: string) => {
+          // 仅记录是否请求额外资源（.data/.mem 等）
+          try { stderr.push("[locateFile] " + path + " base=" + (base || "")); } catch {}
+          return path;
+        },
+        instantiateWasm: (imports: WebAssembly.Imports, ok: (inst: WebAssembly.Instance) => void) => {
           const instance = new WebAssembly.Instance(wasmModule, imports);
-          successCallback(instance);
+          ok(instance);
           return instance.exports as any;
         },
       };
 
-      // 4) 依次尝试几种已知签名
-      const attempts: Array<() => any> = [
-        () => init(dep, moduleOptions),                                  // 常见：init(wasmUrl, options)
-        () => init(moduleOptions),                                       // Emscripten MODULARIZE 常见：init(options)
-        () => init("WORKER", moduleOptions),                             // 某些构建：init(tag, options)
-        () => init({ ...moduleOptions, locateFile: () => String(dep) }), // 通过 locateFile 提供 wasm 路径
+      // 3) 尝试多种签名
+      const attempts: Array<{ label: string, call: () => any }> = [
+        { label: "init(dep, options)", call: () => init(dep, moduleOptions) },
+        { label: "init(options)", call: () => init(moduleOptions) },
+        { label: "init('WORKER', options)", call: () => init("WORKER", moduleOptions) },
+        { label: "init(dep, depSize)", call: () => init(dep, depSize) },
+        { label: "init(depSize, dep)", call: () => init(depSize, dep) },
+        { label: "init(dep, depSize, options)", call: () => init(dep, depSize, moduleOptions) },
+        { label: "init(depSize, options)", call: () => init(depSize, moduleOptions) },
+        { label: "init({ ...options, locateFile: () => String(dep) })", call: () => init({ ...moduleOptions, locateFile: () => String(dep) }) },
       ];
 
-      let php: any = undefined;
-      const attemptErrors: string[] = [];
-      for (const fn of attempts) {
+      const probe: any[] = [];
+      let php: any;
+
+      for (const a of attempts) {
+        let res: any;
+        let note = "";
         try {
-          const res = fn();
-          php = (res && typeof res.then === "function") ? await res : res;
-          if (php && typeof php.callMain === "function") break;
+          res = a.call();
+          if (res && typeof res.then === "function") {
+            note = "awaiting promise";
+            res = await res;
+          }
+          // 若返回函数，再用 options 调用一次（可能是工厂）
+          if (typeof res === "function") {
+            note = (note ? note + " -> " : "") + "calling returned function with options";
+            let tmp = res(moduleOptions);
+            if (tmp && typeof tmp.then === "function") tmp = await tmp;
+            res = tmp;
+          }
+          // 记录
+          probe.push({ label: a.label, result: briefType(res), keys: keysOf(res) });
+          // 成功条件
+          if (res && typeof res.callMain === "function") { php = res; break; }
         } catch (e: any) {
-          attemptErrors.push(e?.message || String(e));
-          php = undefined;
+          probe.push({ label: a.label, error: e?.message || String(e) });
         }
       }
 
-      if (!php || typeof php.callMain !== "function") {
-        // 回显我们尝试过的方法，便于进一步定位
-        const info = {
-          depType: typeof dep,
-          hasDep: !!dep,
-          depCtor: (dep as any)?.constructor?.name || null,
-          attempts: attemptErrors,
-          phpType: typeof php,
-          phpCtor: php?.constructor?.name || null,
-          phpKeys: (() => { try { return Object.keys(php || {}); } catch { return []; } })(),
-        };
-        return new Response(
-          "Runtime error: Emscripten init did not return expected Module.\n" + JSON.stringify(info, null, 2),
-          { status: 500, headers: { "content-type": "text/plain; charset=utf-8" } }
-        );
+      // 专用探测路由
+      if (url.pathname === "/__probe") {
+        return new Response(JSON.stringify({
+          dep: briefType(dep),
+          depSize,
+          attempts: probe,
+          stderr,
+        }, null, 2), { headers: { "content-type": "application/json" } });
       }
 
-      // 5) 执行 phpinfo()
+      if (!php || typeof php.callMain !== "function") {
+        return new Response("Runtime error: Emscripten init did not return expected Module.\n" +
+          JSON.stringify({ dep: briefType(dep), depSize, attempts: probe, stderr }, null, 2),
+          { status: 500, headers: { "content-type": "text/plain; charset=utf-8" } });
+      }
+
+      // 4) 执行 phpinfo()
       try {
         php.callMain(["-r", "phpinfo();"]);
       } catch (e: any) {
@@ -109,8 +144,7 @@ export default {
         headers: { "content-type": stdout.length ? "text/html; charset=utf-8" : "text/plain; charset=utf-8" }
       });
     } catch (e: any) {
-      const msg = e?.stack || e?.message || String(e);
-      return new Response("Runtime error: " + msg, {
+      return new Response("Runtime error: " + (e?.stack || e?.message || String(e)), {
         status: 500,
         headers: { "content-type": "text/plain; charset=utf-8" }
       });
