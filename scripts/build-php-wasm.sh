@@ -82,15 +82,24 @@ if [ $CFG_RC -ne 0 ]; then
   exit $CFG_RC
 fi
 
-# Compile with low parallelism for clearer logs
+# Compile with low parallelism for clearer logs and capture to build.log
 JOBS="${JOBS:-1}"
-echo "[*] emmake make -j${JOBS} V=1 ..."
-emmake make -j"${JOBS}" V=1 || {
-  echo "[-] Build failed. Showing last errors..."
-  # Try to print last compiler error lines if available
-  grep -RIn --color=never -E "error:|undefined reference|was not declared" . | tail -n 200 || true
-  exit 1
-}
+echo "[*] emmake make -j${JOBS} V=1 (logging to ${OUT_DIR}/build.log) ..."
+set -o pipefail
+emmake make -j"${JOBS}" V=1 2>&1 | tee "${OUT_DIR}/build.log"
+EC=${PIPESTATUS[0]}
+set +o pipefail
+if [ ${EC} -ne 0 ]; then
+  echo "[-] Build failed. Showing relevant compiler errors from build.log:"
+  # Show only lines near emcc/em++ that contain 'error:'
+  awk '
+    /\/emsdk\/upstream\/emscripten\/em(cc|\+\+)/ { incc=1; print; next }
+    incc && /error:/ { print; shown+=1; if (shown>=50) exit }
+  ' "${OUT_DIR}/build.log" || true
+  echo "---- tail of build.log (last 400 lines) ----"
+  tail -n 400 "${OUT_DIR}/build.log" || true
+  exit ${EC}
+fi
 
 echo "[*] Packaging to ${OUT_DIR}/php_8_4.js / .wasm ..."
 if [ -f "sapi/cli/php.js" ] && [ -f "sapi/cli/php.wasm" ]; then
@@ -103,7 +112,7 @@ elif ls sapi/cli/*.bc >/dev/null 2>&1; then
     ${CPPFLAGS_IN} ${CFLAGS_IN} ${LDFLAGS_IN} \
     -s INITIAL_MEMORY=268435456
 else
-  echo "[-] Could not find Emscripten outputs (sapi/cli/php.js or .bc)."
+  echo "[-] Could not find Emscripten outputs (sapi/cli/php.js or .bc). Listing sapi/cli:"
   ls -lah sapi/cli/ || true
   exit 1
 fi
