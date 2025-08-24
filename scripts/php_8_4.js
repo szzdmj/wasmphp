@@ -16,13 +16,37 @@ export async function init(RuntimeName, PHPLoader) {
     var scriptDirectory = "";
     var wasmBinary = Module["wasmBinary"];
 
-    // PATCH: 强制异步 wasm 加载
-    Module.instantiateWasm = async function(importObject, successCallback) {
-      // Cloudflare Worker 支持的异步加载方式
-      const { instance } = await WebAssembly.instantiate(wasmBinary, importObject);
-      successCallback(instance);
-      return instance.exports;
+    // FIX: instantiateWasm 必须是同步签名，且返回 exports 或空对象（回调路径）
+    Module.instantiateWasm = function(importObject, successCallback) {
+      try {
+        const bin = Module["wasmBinary"];
+
+        // 1) 绑定为已编译的 WebAssembly.Module（wrangler wasm_modules 注入的典型形态）
+        if (typeof WebAssembly !== "undefined" && bin instanceof WebAssembly.Module) {
+          const instance = new WebAssembly.Instance(bin, importObject);
+          successCallback(instance);
+          return instance.exports; // 同步返回 exports
+        }
+
+        // 2) 绑定为 ArrayBuffer / Uint8Array（二进制）
+        if (bin && (bin instanceof ArrayBuffer || (bin.buffer instanceof ArrayBuffer))) {
+          WebAssembly.instantiate(bin, importObject).then(({ instance }) => {
+            successCallback(instance);
+          }).catch((e) => {
+            if (Module.printErr) Module.printErr("instantiateWasm failed: " + e?.message);
+            throw e;
+          });
+          return {}; // 走回调路径时返回空对象
+        }
+
+        // 无有效二进制
+        throw new Error("wasmBinary not provided or invalid. Expect WebAssembly.Module or ArrayBuffer.");
+      } catch (e) {
+        if (Module.printErr) Module.printErr("instantiateWasm exception: " + (e?.message || e));
+        throw e;
+      }
     };
+
     function locateFile(path) {
         if (Module["locateFile"]) {
             return Module["locateFile"](path, scriptDirectory)
@@ -32,10 +56,9 @@ export async function init(RuntimeName, PHPLoader) {
     var readAsync, readBinary;
     if (ENVIRONMENT_IS_WEB || ENVIRONMENT_IS_WORKER) {
         if (ENVIRONMENT_IS_WORKER) {
-            // 兼容 Cloudflare Worker 环境，避免 self.location 可能为 undefined
             scriptDirectory = (typeof self !== "undefined" && self.location && self.location.href) ? self.location.href : "";
         }
-        // --- EventEmitter patch 保留 ---
+        // EventEmitter 精简保留
         var EventEmitter = class EventEmitter {
             constructor() { this.listeners = {}; }
             emit(eventName, data) {
@@ -61,7 +84,6 @@ export async function init(RuntimeName, PHPLoader) {
                 if (idx >= 0) this.listeners[eventName].splice(idx, 1);
             }
         };
-        // --- End EventEmitter patch ---
         // 不 fetch，不引用 url
     }
     var out = Module["print"] || console.log.bind(console);
@@ -70,7 +92,6 @@ export async function init(RuntimeName, PHPLoader) {
     if (Module["arguments"]) arguments_ = Module["arguments"];
     if (Module["thisProgram"]) thisProgram = Module["thisProgram"];
     if (Module["quit"]) quit_ = Module["quit"];
-    var wasmBinary = Module["wasmBinary"];
     var wasmMemory;
     var ABORT = false;
     var EXITSTATUS;
@@ -96,13 +117,7 @@ export async function init(RuntimeName, PHPLoader) {
     var stackRestore = val => __emscripten_stack_restore(val);
     var stackSave = () => _emscripten_stack_get_current();
     var UTF8Decoder = typeof TextDecoder != "undefined" ? new TextDecoder("utf8") : undefined;
-    // url = SOCKFS.websocketArgs["url"](...arguments); // removed for Cloudflare/Browser use
 
-    /**
-     * Debugging Asyncify errors is tricky because the stack trace is lost when the
-     * error is thrown. This code saves the stack trace in a global variable
-     * so that it can be inspected later.
-     */
     PHPLoader.debug = 'debug' in PHPLoader ? PHPLoader.debug : true;
     if (PHPLoader.debug && typeof Asyncify !== "undefined") {
         const originalHandleSleep = Asyncify.handleSleep;
@@ -114,13 +129,6 @@ export async function init(RuntimeName, PHPLoader) {
         }
     }
 
-    /**
-     * Data dependencies call removeRunDependency() when they are loaded.
-     * The synchronous call stack then continues to run. If an error occurs
-     * in PHP initialization, e.g. Out Of Memory error, it will not be
-     * caught by any try/catch. This override propagates the failure to
-     * PHPLoader.onAbort() so that it can be handled.
-     */
     const originalRemoveRunDependency = PHPLoader['removeRunDependency'];
     PHPLoader['removeRunDependency'] = function (...args) {
         try {
@@ -130,30 +138,10 @@ export async function init(RuntimeName, PHPLoader) {
         }
     }
 
-    /**
-     * Other exports live in the Dockerfile in:
-     *
-     * * EXPORTED_RUNTIME_METHODS
-     * * EXPORTED_FUNCTIONS
-     *
-     * These exports, however, live in here because:
-     *
-     * * Listing them in EXPORTED_RUNTIME_METHODS doesn't actually
-     *   export them. This could be a bug in Emscripten or a consequence of
-     *   that option being deprecated.
-     * * Listing them in EXPORTED_FUNCTIONS works, but they are overridden
-     *   on every `BasePHP.run()` call. This is a problem because we want to
-     *   spy on these calls in some unit tests.
-     *
-     * Therefore, we export them here.
-     */
     PHPLoader['malloc'] = _malloc;
     PHPLoader['free'] = typeof _free === 'function' ? _free : PHPLoader['_wasm_free'];
 
     if (typeof NODEFS === 'object') {
-        // We override NODEFS.createNode() to add an `isSharedFS` flag to all NODEFS
-        // nodes. This way we can tell whether file-locking is needed and possible
-        // for an FS node, even if wrapped with PROXYFS.
         const originalCreateNode = NODEFS.createNode;
         NODEFS.createNode = function createNodeWithSharedFlag() {
             const node = originalCreateNode.apply(NODEFS, arguments);
@@ -167,25 +155,16 @@ export async function init(RuntimeName, PHPLoader) {
                 typeof locking === 'object' &&
                 locking?.is_shared_fs_node(node)
             ) {
-                // Avoid caching shared VFS nodes so multiple instances
-                // can access the same underlying filesystem without
-                // conflicting caches.
                 return;
             }
             return originalHashAddNode.apply(FS, arguments);
         };
     }
 
-    /**
-     * Expose the PHP version so the PHP class can make version-specific
-     * adjustments to `php.ini`.
-     */
     PHPLoader['phpVersion'] = (() => {
         const [major, minor, patch] = phpVersionString.split('.').map(Number);
         return { major, minor, patch };
     })();
 
     return PHPLoader;
-
-    // Close the opening bracket from esm-prefix.js:
 }
