@@ -1,14 +1,11 @@
 {
   "name": "wasmphp",
   "version": "1.0.0",
-  "type": "module",
-  "main": "dist/index.js",
+  "private": true,
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --format=esm --target=esnext --outdir=dist --loader:.wasm=binary --loader:.php=text",
-    "deploy": "wrangler deploy",
-    "dev": "wrangler dev"
+    "build": "esbuild src/index.ts --bundle --format=esm --target=esnext --outdir=dist --loader:.wasm=file --loader:.php=text"
   },
   "devDependencies": {
-    "esbuild": "^0.19.0"
+    "esbuild": "^0.21.0"
   }
 }
