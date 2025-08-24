@@ -1,9 +1,9 @@
-// Remove dynamic code generation and default to inline wasmBinary.
-// Keep proxy routes (/scripts/php_8_4.wasm, /wasm/php_8_4.wasm) and probe (/__probe).
+// Cloudflare Workers friendly entry.
+// - Prefer precompiled WASM module via env.PHP_WASM to avoid runtime codegen.
+// - Keep probe and proxy routes. Falls back to network only if no binding is present.
 
 import createPHP from '../scripts/php_8_4_cf.js';
 
-const JS_UPSTREAM = 'https://raw.githubusercontent.com/szzdmj/wasmphp/main/scripts/php_8_4.js';
 const WASM_UPSTREAM = 'https://raw.githubusercontent.com/szzdmj/wasmphp/main/scripts/php_8_4.wasm';
 
 const SCRIPTS_PATH = '/scripts/php_8_4.wasm';
@@ -36,7 +36,7 @@ function textResponse(body: string, status = 200, headers: Record<string, string
 
 async function proxyWasm(upstream: string, routeName: 'scripts' | 'wasm') {
   const r = await fetch(upstream, {
-    // @ts-ignore allow CF cache hint
+    // @ts-ignore Cloudflare cache hint
     cf: { cacheTtl: 300, cacheEverything: true },
   });
   if (!r.ok) {
@@ -50,8 +50,18 @@ async function proxyWasm(upstream: string, routeName: 'scripts' | 'wasm') {
   return new Response(r.body, { status: r.status, headers: respHeaders });
 }
 
+// Provide an instantiateWasm hook that uses a precompiled WebAssembly.Module binding.
+function makeInstantiateWithModule(wasmModule: WebAssembly.Module) {
+  return (info: WebAssembly.Imports /* imports */, receiveInstance: (i: WebAssembly.Instance) => void) => {
+    // Use synchronous instantiation so Emscripten can proceed immediately.
+    const instance = new WebAssembly.Instance(wasmModule, info);
+    // Returning exports synchronously is the Emscripten-supported fast path.
+    return instance.exports as any;
+  };
+}
+
 export default {
-  async fetch(request: Request): Promise<Response> {
+  async fetch(request: Request, env: any): Promise<Response> {
     const url = new URL(request.url);
     const { pathname, origin } = url;
 
@@ -68,15 +78,16 @@ export default {
       const upstream = await fetchInfo(WASM_UPSTREAM);
       const originScripts = await fetchInfo(new URL(SCRIPTS_PATH, origin).toString());
       const originWasm = await fetchInfo(new URL(WASM_PATH, origin).toString());
-      const selfFetchLikelyBlocked =
-        upstream.ok && (!originScripts.ok || !originWasm.ok);
-
+      const hasBinding = typeof env?.PHP_WASM !== 'undefined';
       const body = {
         importMetaAvailable: typeof import.meta !== 'undefined',
+        hasBinding,
         upstream,
         originScripts,
         originWasm,
-        selfFetchLikelyBlocked,
+        note: hasBinding
+          ? 'WASM will be instantiated from binding (no runtime codegen).'
+          : 'No binding detected; runtime instantiation may be blocked by embedder.',
       };
       return new Response(JSON.stringify(body, null, 2), {
         status: 200,
@@ -84,8 +95,7 @@ export default {
       });
     }
 
-    // Default root path: initialize PHP WASM
-    // Switches:
+    // Switches retained for non-binding fallback/testing:
     // - ?inline=0 -> disable inline wasmBinary (use network via locateFile)
     // - ?useUpstream=1 -> force upstream URL for locateFile
     // - ?useOrigin=scripts|wasm -> force same-origin proxy route for locateFile
@@ -98,17 +108,20 @@ export default {
       if (useOrigin === 'scripts') return new URL(SCRIPTS_PATH, origin).toString();
       if (useOrigin === 'wasm') return new URL(WASM_PATH, origin).toString();
       if (useUpstream) return WASM_UPSTREAM;
-      // Fallback: upstream
       return WASM_UPSTREAM;
     };
 
     try {
+      const hasBinding = typeof env?.PHP_WASM !== 'undefined';
       const opts: any = { locateFile };
 
-      // Default inline mode: prefetch wasm and pass as wasmBinary to avoid any network
-      if (inline) {
+      if (hasBinding) {
+        // Use precompiled module binding to avoid runtime code generation.
+        opts.instantiateWasm = makeInstantiateWithModule(env.PHP_WASM as WebAssembly.Module);
+      } else if (inline) {
+        // Fallback: prefetch wasm and inline bytes (may still be blocked by embedder in some environments)
         const wasmRes = await fetch(WASM_UPSTREAM, {
-          // @ts-ignore allow CF cache hint
+          // @ts-ignore Cloudflare cache hint
           cf: { cacheTtl: 300, cacheEverything: true },
         });
         if (!wasmRes.ok) {
@@ -118,14 +131,9 @@ export default {
         opts.wasmBinary = new Uint8Array(buf);
       }
 
-      // Initialize the PHP WASM module (no eval/new Function)
       const mod = await createPHP(opts);
-      // If initialization reached here, Module is ready. We don't run PHP code here;
-      // the goal is to prove instantiation works without dynamic code generation.
       return textResponse(
-        `Hello from PHP WASM (initialized). inline=${inline ? 1 : 0}, locateFile=${locateFile(
-          'php_8_4.wasm',
-        )}`,
+        `Hello from PHP WASM (initialized). binding=${hasBinding ? 1 : 0}, inline=${inline ? 1 : 0}`,
       );
     } catch (e: any) {
       const detail = e?.stack || String(e);
