@@ -25,6 +25,28 @@ export default {
         printErr: (txt: string) => stderr.push(String(txt)),
       });
 
+      // Wait for runtime to be fully initialized
+      if (php.onRuntimeInitialized && !php.FS) {
+        await new Promise<void>((resolve) => {
+          const originalCallback = php.onRuntimeInitialized;
+          php.onRuntimeInitialized = () => {
+            if (originalCallback) originalCallback();
+            resolve();
+          };
+        });
+      }
+
+      // Debug: Check what we have after waiting
+      const hasFS = php && 'FS' in php;
+      const hasCallMain = php && 'callMain' in php;
+      
+      if (!hasFS || !hasCallMain) {
+        return new Response(`Debug after waiting: FS available: ${hasFS}, callMain available: ${hasCallMain}\nPHP keys: ${Object.keys(php || {}).join(', ')}`, {
+          status: 500,
+          headers: { "content-type": "text/plain; charset=utf-8" },
+        });
+      }
+
       // Prepare VFS and write /public/index.php
       try { php.FS.mkdir("/public"); } catch {}
       php.FS.writeFile("/public/index.php", indexPhpSource);
@@ -37,7 +59,7 @@ export default {
         if (e?.message) stderr.push(e.message);
       }
 
-      const body = stdout.length ? stdout.join("\n") : (stderr.length ? stderr.join("\n") : "");
+      const body = stdout.length ? stdout.join("") : (stderr.length ? stderr.join("\n") : "");
       const status = stdout.length ? 200 : (stderr.length ? 500 : 204);
 
       return new Response(body, {

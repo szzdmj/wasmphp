@@ -9,6 +9,7 @@
     "dev": "wrangler dev"
   },
   "devDependencies": {
-    "esbuild": "^0.19.0"
+    "esbuild": "^0.19.0",
+    "wrangler": "^4.32.0"
   }
 }
