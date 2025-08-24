@@ -4,7 +4,7 @@
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --format=esm --target=esnext --outdir=dist --loader:.wasm=binary",
+    "build": "esbuild src/index.ts --bundle --format=esm --target=esnext --outdir=dist --loader:.wasm=binary --loader:.php=text",
     "deploy": "wrangler deploy",
     "dev": "wrangler dev"
   },
