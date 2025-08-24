@@ -1,5 +1,12 @@
 {
   "name": "wasmphp",
   "main": "src/index.ts",
-  "compatibility_date": "2025-08-23"
+  "compatibility_date": "2025-08-23",
+
+  // 若 Workers 环境支持 wasm_modules（标准做法），请启用以下映射：
+  // - 构建/发布时由 Cloudflare 预编译 .wasm
+  // - 运行时通过 env.PHP_WASM 注入 WebAssembly.Module
+  "wasm_modules": {
+    "PHP_WASM": "./scripts/php_8_4.wasm"
+  }
 }
