@@ -1,17 +1,16 @@
-// 默认保持“早上的代码状态”：locateFile 使用 import.meta.url（便于复现当前错误）。
-// 增量能力：
-// - /scripts/php_8_4.wasm 与 /wasm/php_8_4.wasm：反代 GitHub raw 到同源，并加 x-worker-route 标头。
-// - /__probe：检查 import.meta.url、两个同源路径、upstream，并判断是否可能触发了 Workers 的自调用保护。
-// - /health：健康检查。
-// - 调试开关（只有你显式加参数才生效，不改变默认行为）：
-//   - ?useUpstream=1   -> locateFile 对 .wasm 走 upstream（raw.githubusercontent.com）
-//   - ?useOrigin=scripts|wasm -> locateFile 对 .wasm 走同源 /scripts 或 /wasm
-//   - ?inline=1        -> 预抓 upstream 的 wasm 字节并通过 wasmBinary 传给 Emscripten，彻底避免网络加载
+// 默认保留“早上”的整体结构（路由/探针/打印等）。
+// 关键修正：locateFile 不再使用 import.meta.url，避免在 Workers 环境中抛错。
+// 支持调试开关：
+// - ?useUpstream=1   -> .wasm 走 GitHub raw（避免自调用）
+// - ?useOrigin=scripts|wasm -> .wasm 走同源路径（仅外部访问可用；Worker 内部自调用可能 404）
+// - ?inline=1        -> 预抓取 upstream 的 .wasm 字节并以 wasmBinary 传入，彻底避免网络加载
 
 import createPHP from '../scripts/php_8_4.js';
 
-// 如需锁定稳定版本，建议把 main 换成固定 commit SHA
+// 如需锁定稳定版本，可将 main 换为固定 commit SHA
 const WASM_UPSTREAM = 'https://raw.githubusercontent.com/szzdmj/wasmphp/main/scripts/php_8_4.wasm';
+
+// 同源提供的两个备用路径（均反代到 upstream）
 const SCRIPTS_PATH = '/scripts/php_8_4.wasm';
 const WASM_PATH = '/wasm/php_8_4.wasm';
 
@@ -45,7 +44,7 @@ export default {
     // 反代到同源：/scripts/php_8_4.wasm
     if (url.pathname === SCRIPTS_PATH) {
       const res = await fetch(WASM_UPSTREAM, {
-        // @ts-ignore 可选：开启 CF 边缘缓存
+        // @ts-ignore Cloudflare 可选缓存
         cf: { cacheTtl: 300, cacheEverything: true },
       });
       if (!res.ok) {
@@ -72,7 +71,7 @@ export default {
     // 反代到同源：/wasm/php_8_4.wasm（备用路径）
     if (url.pathname === WASM_PATH) {
       const res = await fetch(WASM_UPSTREAM, {
-        // @ts-ignore 可选：开启 CF 边缘缓存
+        // @ts-ignore Cloudflare 可选缓存
         cf: { cacheTtl: 300, cacheEverything: true },
       });
       if (!res.ok) {
@@ -98,7 +97,7 @@ export default {
 
     // 探针
     if (url.pathname === '/__probe') {
-      // import.meta.url 可用性
+      // import.meta.url 在 Workers 模块中常为不可用，这里仅报告，不再依赖
       let importMetaUrl: string | null = null;
       try {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -107,30 +106,15 @@ export default {
         importMetaUrl = null;
       }
 
-      // 基于 import.meta.url 的候选
-      let wasmURL_from_importMeta: string | null = null;
-      if (importMetaUrl) {
-        try {
-          wasmURL_from_importMeta = new URL('../scripts/php_8_4.wasm', importMetaUrl).href;
-        } catch {
-          wasmURL_from_importMeta = null;
-        }
-      }
-
       const scriptsURL = `${url.origin}${SCRIPTS_PATH}`;
       const wasmURL = `${url.origin}${WASM_PATH}`;
 
       const checkScripts = await fetchInfo(`${scriptsURL}?__ping=1`);
       const checkWasm = await fetchInfo(`${wasmURL}?__ping=1`);
-      const fromImportMeta = wasmURL_from_importMeta
-        ? await fetchInfo(wasmURL_from_importMeta)
-        : { ok: false, status: -1, headers: {}, error: 'import.meta.url unavailable' };
       const fromUpstream = await fetchInfo(WASM_UPSTREAM);
 
       const routeHitScripts = checkScripts.headers['x-worker-route'] === 'scripts';
       const routeHitWasm = checkWasm.headers['x-worker-route'] === 'wasm';
-
-      // 在 Workers 中自调用同一 workers.dev 服务常见会被保护，呈现 404。根据现象给出提示标记。
       const selfFetchLikelyBlocked =
         !routeHitScripts &&
         !routeHitWasm &&
@@ -141,7 +125,6 @@ export default {
       const payload = {
         importMetaUrlPresent: typeof importMetaUrl === 'string',
         importMetaUrl,
-        wasmURL_from_importMeta,
         scriptsURL,
         wasmURL,
         routeHitScripts,
@@ -149,7 +132,6 @@ export default {
         selfFetchLikelyBlocked,
         fetch_scripts: checkScripts,
         fetch_wasm: checkWasm,
-        fetch_from_importMeta: fromImportMeta,
         fetch_from_upstream: fromUpstream,
       };
 
@@ -158,18 +140,18 @@ export default {
       });
     }
 
-    // 正常路径：默认维持 import.meta.url 的写法；仅在你显式加开关时才绕过
+    // 正常路径
     let out = '';
     try {
       const useOrigin = url.searchParams.get('useOrigin'); // 'scripts' | 'wasm' | null
       const useUpstream = url.searchParams.get('useUpstream') === '1';
       const inline = url.searchParams.get('inline') === '1';
 
-      // inline=1: 直接抓取 upstream 的 WASM 并以 wasmBinary 传入，彻底避免网络加载环节
+      // inline=1: 预抓 upstream 的 WASM 并以 wasmBinary 传给 Emscripten，彻底避免网络加载
       let wasmBinary: Uint8Array | undefined;
       if (inline) {
         const upstreamRes = await fetch(WASM_UPSTREAM, {
-          // @ts-ignore 可选：缓存
+          // @ts-ignore 可选缓存
           cf: { cacheTtl: 300, cacheEverything: true },
         });
         if (!upstreamRes.ok) {
@@ -180,18 +162,20 @@ export default {
       }
 
       const php = await createPHP({
-        // Emscripten 会优先使用 wasmBinary；若提供了则不会再去拉取 .wasm
+        // 若提供 wasmBinary，Emscripten 将不会再发起网络请求加载 .wasm
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         ...(wasmBinary ? ({ wasmBinary } as any) : {}),
         locateFile: (p: string) => {
+          // 关键修正：完全不再使用 import.meta.url
           if (p.endsWith('.wasm')) {
             if (useUpstream) return WASM_UPSTREAM;
-            if (useOrigin === 'scripts') return `${url.origin}/scripts/${p}`;
             if (useOrigin === 'wasm') return `${url.origin}/wasm/${p}`;
+            if (useOrigin === 'scripts') return `${url.origin}/scripts/${p}`;
+            // 默认仍指向同源 scripts（便于与你的“早上状态”对照；内部自调用会 404，可用开关绕过）
+            return `${url.origin}/scripts/${p}`;
           }
-          // 原始写法：基于 import.meta.url（在 Worker 模块里会触发你当前的错误）
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          return new URL(`../scripts/${p}`, (import.meta as any).url).href;
+          // 对非 .wasm 资源，返回原样或映射到 scripts，同样不触发 import.meta.url
+          return p;
         },
         print: (txt: string) => { out += txt + '\n'; },
         printErr: (txt: string) => { out += '[stderr] ' + txt + '\n'; },
