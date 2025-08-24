@@ -2,9 +2,5 @@
   "name": "wasmphp",
   "main": "dist/index.js",
   "compatibility_date": "2025-08-23",
-  "modules": true,
-  "build": { "command": "npm run build" },
-  "wasm_modules": {
-    "PHP_WASM": "scripts/php_8_4.wasm"
-  }
+  "build": { "command": "npm run build" }
 }
