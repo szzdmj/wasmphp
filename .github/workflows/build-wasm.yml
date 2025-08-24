@@ -18,16 +18,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build docker image (emscripten+deps)
+      - name: Ensure LF line endings and executable bit
+        shell: bash
         run: |
-          docker build -f docker/Dockerfile.php-wasm -t php-wasm:single .
+          # Normalize line endings (in case of CRLF)
+          sed -i 's/\r$//' scripts/build-php-wasm.sh
+          # Make it executable (even if repo missed +x)
+          chmod +x scripts/build-php-wasm.sh
+
+      - name: Build docker image (emscripten+deps)
+        run: docker build -f docker/Dockerfile.php-wasm -t php-wasm:single .
 
       - name: Build PHP Wasm (single-thread)
         run: |
           docker run --rm \
             -v "${GITHUB_WORKSPACE}:/work" \
             -e MAKEFLAGS="-j$(nproc)" \
-            php-wasm:single /bin/bash -lc "cd /work && ./scripts/build-php-wasm.sh"
+            php-wasm:single /bin/bash -lc "cd /work && bash ./scripts/build-php-wasm.sh"
 
       - name: List outputs
         run: ls -lah scripts/ || true
