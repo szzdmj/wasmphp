@@ -1,14 +1,11 @@
-// V34 执行版（默认禁用 JIT + 支持从仓库执行 public/index.php）
-// 关键点：
-// - 默认注入 -d pcre.jit=0, opcache.enable_cli=0, opcache.jit=0，避免 munmap() 退出错误
-// - 新增路由 /public/index.php：从 GitHub Raw 拉取 PHP 源，去掉 <?php，用 -r 执行
-// - 其它：/info(/ /)、/run、/version、/help、/__probe、/__jsplus、/__mod 仍保留
-//
-// 构建形态：Emscripten minimal runtime（不导出 callMain/run），使用 noInitialRun=false + arguments 自动执行 main(argv)
+// V35 执行版（更彻底禁用 JIT/映射 + 修正输出缓冲 + /public 支持自定义 ini）
+// - 默认禁用 PCRE JIT、Opcache（包含 enable 与 JIT）、并关闭输出缓冲让 echo 立即可见
+// - /public/index.php 支持 ?d=key=value 附加 ini，便于临时排查
+// - 构建形态：Emscripten minimal runtime（无 callMain/run），使用 noInitialRun=false + arguments
 
 import wasmAsset from "../scripts/php_8_4.wasm";
 
-// 轻量 polyfill，避免 glue 顶层访问 location/self 抛错
+// 轻量 polyfill
 (function ensureGlobals() {
   const g = globalThis as any;
   if (typeof g.location === "undefined" || typeof g.location?.href === "undefined") {
@@ -21,11 +18,22 @@ import wasmAsset from "../scripts/php_8_4.wasm";
   }
 })();
 
-// 默认 INI（禁用 JIT，避免 munmap）
+// 默认 INI（禁用一切可能 mmap 的组件 + 让输出立即可见）
 const DEFAULT_INIS = [
+  // 关闭 PCRE 与 Opcache 的 JIT/缓存
   "pcre.jit=0",
+  "opcache.enable=0",
   "opcache.enable_cli=0",
   "opcache.jit=0",
+  "opcache.jit_buffer_size=0",
+  "opcache.file_cache=",
+  // 输出相关：CLI 默认有输出缓冲，关闭并启用即时刷新，避免没换行的 echo 被吞
+  "output_buffering=0",
+  "implicit_flush=1",
+  "zlib.output_compression=0",
+  // 诊断更直观
+  "display_errors=1",
+  "display_startup_errors=1",
 ];
 
 function isWasmModule(x: any): x is WebAssembly.Module {
@@ -33,7 +41,6 @@ function isWasmModule(x: any): x is WebAssembly.Module {
 }
 
 function makeInstantiateWithModule(wasmModule: WebAssembly.Module) {
-  // 兼容 Emscripten：既返回 exports，也调用 successCallback
   return (imports: WebAssembly.Imports, successCallback: (i: WebAssembly.Instance) => void) => {
     const instance = new WebAssembly.Instance(wasmModule, imports);
     try { successCallback(instance); } catch {}
@@ -55,9 +62,19 @@ type RunResult = {
   error?: string;
 };
 
+function parseIniParams(url: URL): string[] {
+  const out: string[] = [];
+  const ds = url.searchParams.getAll("d").concat(url.searchParams.getAll("ini"));
+  for (const s of ds) {
+    const t = s.trim();
+    if (t && t.includes("=")) out.push(t);
+  }
+  return out;
+}
+
 function buildArgvForCode(code: string, iniList: string[] = []): string[] {
   const argv: string[] = [];
-  // 默认注入 -d
+  // 默认注入
   for (const d of DEFAULT_INIS) argv.push("-d", d);
   // 追加调用者传入的 -d
   for (const d of iniList) if (d) argv.push("-d", d);
@@ -67,7 +84,6 @@ function buildArgvForCode(code: string, iniList: string[] = []): string[] {
 }
 
 async function buildModuleOptions(argv: string[]) {
-  // minimal runtime：初始化后自动执行 main(argv)
   const opts: any = {
     noInitialRun: false,
     arguments: argv.slice(),
@@ -165,16 +181,6 @@ async function createPhpModuleAndRun(argv: string[], waitMs = 8000): Promise<Run
   }
 }
 
-function parseIniParams(url: URL): string[] {
-  const out: string[] = [];
-  const ds = url.searchParams.getAll("d").concat(url.searchParams.getAll("ini"));
-  for (const s of ds) {
-    const t = s.trim();
-    if (t && t.includes("=")) out.push(t);
-  }
-  return out;
-}
-
 function inferContentTypeFromOutput(stdout: string, fallback = "text/plain; charset=utf-8") {
   if (stdout.includes("<html") || stdout.includes("<!DOCTYPE html")) return "text/html; charset=utf-8";
   return fallback;
@@ -241,15 +247,13 @@ function normalizePhpCodeForEval(src: string): string {
   let s = src.trimStart();
   if (s.startsWith("<?php")) s = s.slice(5);
   else if (s.startsWith("<?")) s = s.slice(2);
-  // 去掉可能的结尾 ?>（非必须）
-  s = s.replace(/\?>\s*$/s, "");
+  s = s.replace(/\?>\s*$/s, ""); // 去掉尾部 ?>（可选）
   return s;
 }
 
 async function fetchGithubPhpSource(owner: string, repo: string, path: string, ref?: string): Promise<{ ok: boolean; code?: string; err?: string }> {
   const branch = (ref && ref.trim()) || "main";
   const url = `https://raw.githubusercontent.com/${owner}/${repo}/${encodeURIComponent(branch)}/${path.replace(/^\/+/, "")}`;
-  // 避免缓存：no-store，并通过 cf 关闭边缘缓存
   const res = await fetch(url, {
     method: "GET",
     headers: { "cache-control": "no-cache" },
@@ -259,7 +263,6 @@ async function fetchGithubPhpSource(owner: string, repo: string, path: string, r
     const txt = await res.text();
     return { ok: true, code: normalizePhpCodeForEval(txt) };
   }
-  // 尝试 master 回退
   if (branch !== "master") {
     const url2 = `https://raw.githubusercontent.com/${owner}/${repo}/master/${path.replace(/^\/+/, "")}`;
     const res2 = await fetch(url2, { headers: { "cache-control": "no-cache" }, cf: { cacheTtl: 0, cacheEverything: false } as any });
@@ -272,10 +275,11 @@ async function fetchGithubPhpSource(owner: string, repo: string, path: string, r
 }
 
 async function routeRepoIndex(url: URL): Promise<Response> {
-  const ref = url.searchParams.get("ref") || undefined; // 支持 ?ref= 分支或提交
+  const ref = url.searchParams.get("ref") || undefined;
   const pull = await fetchGithubPhpSource("szzdmj", "wasmphp", "public/index.php", ref);
   if (!pull.ok) return textResponse(pull.err || "Fetch error", 502);
-  const argv = buildArgvForCode(pull.code!);
+  const ini = parseIniParams(url); // 支持 ?d= 覆盖
+  const argv = buildArgvForCode(pull.code!, ini);
   const res = await createPhpModuleAndRun(argv, 10000);
   if (!res.ok) {
     const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
@@ -315,7 +319,6 @@ export default {
 
     if (pathname === "/health") return textResponse("ok");
 
-    // 诊断：环境
     if (pathname === "/__probe") {
       let importMetaUrl: string | null = null;
       try { importMetaUrl = (import.meta as any)?.url ?? null; } catch { importMetaUrl = null; }
@@ -331,7 +334,6 @@ export default {
       return new Response(JSON.stringify(body, null, 2), { status: 200, headers: { "content-type": "application/json; charset=utf-8" } });
     }
 
-    // 诊断：仅导入 glue
     if (pathname === "/__jsplus") {
       try {
         const mod = await import("../scripts/php_8_4.js");
@@ -344,7 +346,6 @@ export default {
       }
     }
 
-    // 诊断：模块导出形态（初始化后）
     if (pathname === "/__mod") {
       const argv = buildArgvForCode("echo 'ok';");
       const res = await createPhpModuleAndRun(argv);
@@ -369,26 +370,21 @@ export default {
       return new Response(JSON.stringify(summary, null, 2), { status: 200, headers: { "content-type": "application/json; charset=utf-8" } });
     }
 
-    // 信息页：phpinfo
     if (pathname === "/" || pathname === "/index.php" || pathname === "/info") {
       return routeInfo();
     }
 
-    // 从 GitHub 仓库执行 public/index.php
     if (pathname === "/public/index.php") {
       return routeRepoIndex(url);
     }
 
-    // 执行：GET 代码
     if (pathname === "/run" && request.method === "GET") {
       return routeRunGET(url);
     }
-    // 执行：POST 代码（text/plain）
     if (pathname === "/run" && request.method === "POST") {
       return routeRunPOST(request, url);
     }
 
-    // php -v / -h
     if (pathname === "/version") return routeVersion();
     if (pathname === "/help") return routeHelp();
 
