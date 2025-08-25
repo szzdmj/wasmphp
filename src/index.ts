@@ -1,7 +1,7 @@
-// V66h: Smart runner with fallback when callMain/run are missing.
-// - Try callMain: supports MEMFS write + -f path
-// - Fallback to auto-run (noInitialRun=false + arguments) with -r eval(base64_decode(...))
-// - Keep: hardened against 1101, stderr noise filtering, default JIT disabled, __net, raw mode, helpful empty-output hint.
+// V66i: fix "Could not open input file: php" by not injecting a fake program name into argv
+// - callMain() now receives args WITHOUT a leading "php"
+// - auto-run (noInitialRun=false) now sets Module.arguments WITHOUT a leading "php"
+// Keep: hardened against 1101, stderr noise filtering, default JIT disabled, __net, raw mode, helpful empty-output hint, smart fallback.
 
 import wasmAsset from "../scripts/php_8_4.wasm";
 
@@ -151,7 +151,7 @@ async function initPhpModule(): Promise<{ php: any; moduleOptions: any; stdout: 
   return { php, moduleOptions, stdout, stderr, debug };
 }
 
-// Run via callMain if available
+// Run via callMain if available (argv must NOT contain program name)
 async function runViaCallMain(argv: string[], waitMs = 8000, afterInit?: (php: any) => void): Promise<RunResult> {
   try {
     const { php, moduleOptions, stdout, stderr, debug } = await initPhpModule();
@@ -166,15 +166,18 @@ async function runViaCallMain(argv: string[], waitMs = 8000, afterInit?: (php: a
       return { ok: false, stdout, stderr, debug: [...debug, "step:callMain"], error: "No runnable entry point (callMain/run) found on Module." };
     }
 
-    const fullArgv = ["php", ...argv];
     let ran = false;
 
     if (hasCallMain) {
       debug.push("step:callMain");
-      try { (php as any).callMain(fullArgv); ran = true; debug.push("callMain:ok"); } catch (e: any) { stderr.push("callMain threw: " + (e?.message || String(e))); }
+      try { (php as any).callMain(argv.slice()); ran = true; debug.push("callMain:ok"); } catch (e: any) { stderr.push("callMain threw: " + (e?.message || String(e))); }
     }
     if (!ran && hasRun) {
-      try { (php as any).arguments = fullArgv.slice(1); (php as any).run(); ran = true; debug.push("run():ok"); } catch (e: any) { stderr.push("run() threw: " + (e?.message || String(e))); }
+      try { (php as any).arguments = argv.slice(); (php as any).run(); ran = true; debug.push("run():ok"); } catch (e: any) { stderr.push("run() threw: " + (e?.message || String(e))); }
+    }
+
+    if (!ran) {
+      return { ok: false, stdout, stderr, debug, error: "No runnable entry point executed." };
     }
 
     const start = Date.now();
@@ -189,7 +192,7 @@ async function runViaCallMain(argv: string[], waitMs = 8000, afterInit?: (php: a
   }
 }
 
-// Fallback: auto-run with arguments (noInitialRun=false)
+// Fallback: auto-run with arguments (noInitialRun=false); arguments must NOT contain program name
 async function runViaAutoRun(argv: string[], waitMs = 8000): Promise<RunResult> {
   const debug: string[] = [];
   const stdout: string[] = [];
@@ -203,7 +206,7 @@ async function runViaAutoRun(argv: string[], waitMs = 8000): Promise<RunResult> 
       return { ok: false, stdout, stderr, debug, error: "PHP init factory not found" };
     }
     debug.push("fallback:autoRun:build-options");
-    const moduleOptions: any = await buildInitOptions({ noInitialRun: false, arguments: ["php", ...argv] });
+    const moduleOptions: any = await buildInitOptions({ noInitialRun: false, arguments: argv.slice() });
     moduleOptions.print = (txt: string) => { try { stdout.push(String(txt)); } catch {} };
     moduleOptions.printErr = (txt: string) => { try { stderr.push(String(txt)); } catch {} };
     moduleOptions.onRuntimeInitialized = () => { debug.push("fallback:autoRun:event:onRuntimeInitialized"); };
@@ -332,7 +335,6 @@ function toBase64Utf8(s: string): string {
 async function routeInfo(url: URL): Promise<Response> {
   try {
     const argv = buildArgvForCode("phpinfo();");
-    // Try callMain -> fallback auto-run
     let res = await runViaCallMain(argv);
     if (!res.ok && (res.error || "").includes("No runnable entry point")) {
       res = await runViaAutoRun(argv);
@@ -445,7 +447,6 @@ async function routeVersion(): Promise<Response> {
     const argv: string[] = [];
     for (const d of DEFAULT_INIS) { argv.push("-d", d); }
     argv.push("-v");
-    // Prefer callMain, fallback auto-run
     let res = await runViaCallMain(argv);
     if (!res.ok && (res.error || "").includes("No runnable entry point")) {
       res = await runViaAutoRun(argv);
@@ -526,7 +527,6 @@ export default {
 
       if (pathname === "/__mod") {
         try {
-          // Probe available entry points
           const { php, moduleOptions, stdout, stderr, debug } = await initPhpModule();
           const summary = {
             keys: php ? Object.keys(php) : [],
