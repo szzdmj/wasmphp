@@ -1,11 +1,11 @@
-// V66i: fix "Could not open input file: php" by not injecting a fake program name into argv
-// - callMain() now receives args WITHOUT a leading "php"
-// - auto-run (noInitialRun=false) now sets Module.arguments WITHOUT a leading "php"
-// Keep: hardened against 1101, stderr noise filtering, default JIT disabled, __net, raw mode, helpful empty-output hint, smart fallback.
+// V66j: add compact diagnostics so you can paste results easily
+// - New: /__caps 仅返回关键能力布尔值（很短）
+// - New: /__smoke 运行三种最小用例（-r/auto-run、-r/callMain、-f/文件执行），每项只截断前几行
+// - /version 和 /help 支持 ?short=1 仅返回前 20 行
+// 保持：1101 保护、stderr 噪声过滤、/public raw、智能执行（callMain 优先，无法则 auto-run）、空输出提示
 
 import wasmAsset from "../scripts/php_8_4.wasm";
 
-// Minimal globals for Emscripten glue in Workers
 (function ensureGlobals() {
   const g = globalThis as any;
   if (typeof g.location === "undefined" || typeof g.location?.href === "undefined") {
@@ -56,6 +56,10 @@ function makeInstantiateWithModule(wasmModule: WebAssembly.Module) {
 
 function textResponse(body: string, status = 200, headers: Record<string, string> = {}) {
   return new Response(body, { status, headers: { "content-type": "text/plain; charset=utf-8", ...headers } });
+}
+
+function json(data: any, status = 200) {
+  return new Response(JSON.stringify(data, null, 2), { status, headers: { "content-type": "application/json; charset=utf-8" } });
 }
 
 function parseIniParams(url: URL): string[] {
@@ -120,7 +124,6 @@ async function buildInitOptions(base: Partial<any>) {
   throw new Error("Unsupported wasm asset type at runtime");
 }
 
-// Initialize module once (noInitialRun=true)
 async function initPhpModule(): Promise<{ php: any; moduleOptions: any; stdout: string[]; stderr: string[]; debug: string[] }> {
   const debug: string[] = [];
   const stdout: string[] = [];
@@ -151,7 +154,6 @@ async function initPhpModule(): Promise<{ php: any; moduleOptions: any; stdout: 
   return { php, moduleOptions, stdout, stderr, debug };
 }
 
-// Run via callMain if available (argv must NOT contain program name)
 async function runViaCallMain(argv: string[], waitMs = 8000, afterInit?: (php: any) => void): Promise<RunResult> {
   try {
     const { php, moduleOptions, stdout, stderr, debug } = await initPhpModule();
@@ -192,7 +194,6 @@ async function runViaCallMain(argv: string[], waitMs = 8000, afterInit?: (php: a
   }
 }
 
-// Fallback: auto-run with arguments (noInitialRun=false); arguments must NOT contain program name
 async function runViaAutoRun(argv: string[], waitMs = 8000): Promise<RunResult> {
   const debug: string[] = [];
   const stdout: string[] = [];
@@ -230,7 +231,6 @@ async function runViaAutoRun(argv: string[], waitMs = 8000): Promise<RunResult> 
   }
 }
 
-// stderr noise filtering
 function filterKnownNoise(lines: string[], keepAll: boolean) {
   if (keepAll) return { kept: lines.slice(), ignored: 0 };
   const patterns: RegExp[] = [/^munmap\(\)\s+failed:\s+\[\d+\]\s+Invalid argument/i];
@@ -251,7 +251,6 @@ function inferContentTypeFromOutput(stdout: string, fallback = "text/plain; char
   return fallback;
 }
 
-// Unified finalizer with diagnostics when both stdout/stderr are empty
 function finalizeOk(url: URL, res: RunResult, defaultCT: string) {
   const debugMode = url.searchParams.get("debug") === "1" || url.searchParams.get("showstderr") === "1";
   const stdout = res.stdout.join("\n");
@@ -283,10 +282,8 @@ function finalizeOk(url: URL, res: RunResult, defaultCT: string) {
   return new Response(body, { status, headers: { "content-type": ct } });
 }
 
-// ——— GitHub Raw helpers ———
 function normalizePhpCodeForEval(src: string): string {
   let s = src.trimStart();
-  // Remove UTF-8 BOM if present
   if (s.charCodeAt(0) === 0xfeff) s = s.slice(1);
   if (s.startsWith("<?php")) s = s.slice(5);
   else if (s.startsWith("<?")) s = s.slice(2);
@@ -322,13 +319,22 @@ async function fetchGithubPhpSource(owner: string, repo: string, path: string, r
   }
 }
 
-// Base64 (UTF-8) helper
 function toBase64Utf8(s: string): string {
   const bytes = new TextEncoder().encode(s);
   let bin = "";
   const chunk = 0x8000;
   for (let i = 0; i < bytes.length; i += chunk) bin += String.fromCharCode(...bytes.subarray(i, i + chunk));
   return btoa(bin);
+}
+
+// —— Compact utilities ——
+function firstLines(s: string, n: number): string {
+  const lines = s.split(/\r?\n/);
+  return lines.slice(0, n).join("\n");
+}
+function trimArr(arr: string[], maxLines: number): string[] {
+  if (arr.length <= maxLines) return arr;
+  return arr.slice(0, maxLines).concat([`...(+${arr.length - maxLines} more lines)`]);
 }
 
 // ——— Routes ———
@@ -411,7 +417,6 @@ async function routeRepoIndex(url: URL): Promise<Response> {
     const filePath = "/tmp/public_index.php";
     const ini = parseIniParams(url);
 
-    // Try best path: write MEMFS + -f (requires callMain)
     const argvFile = buildArgvForFile(filePath, ini);
     let res = await runViaCallMain(argvFile, 10000, (php) => {
       try {
@@ -423,7 +428,6 @@ async function routeRepoIndex(url: URL): Promise<Response> {
       } catch {}
     });
 
-    // Fallback: -r eval(base64_decode(...)) with auto-run (no MEMFS required)
     if (!res.ok && (res.error || "").includes("No runnable entry point")) {
       const b64 = toBase64Utf8(codeNormalized);
       const oneLiner = `eval(base64_decode('${b64}'));`;
@@ -442,7 +446,7 @@ async function routeRepoIndex(url: URL): Promise<Response> {
   }
 }
 
-async function routeVersion(): Promise<Response> {
+async function routeVersion(url: URL): Promise<Response> {
   try {
     const argv: string[] = [];
     for (const d of DEFAULT_INIS) { argv.push("-d", d); }
@@ -452,14 +456,17 @@ async function routeVersion(): Promise<Response> {
       res = await runViaAutoRun(argv);
       res.debug.unshift("fallback:autoRun");
     }
-    const body = (res.stdout.join("\n") || res.stderr.join("\n") || "") + (res.debug.length ? `\ntrace:${res.debug.join("->")}` : "");
-    return textResponse(body || "", res.ok ? 200 : 500);
+    const out = (res.stdout.join("\n") || res.stderr.join("\n") || "");
+    const short = url.searchParams.get("short") === "1";
+    const body = short ? firstLines(out, 20) : out;
+    const trace = res.debug.length ? `\ntrace:${res.debug.join("->")}` : "";
+    return textResponse((body || "") + trace, res.ok ? 200 : 500);
   } catch (e: any) {
     return textResponse("routeVersion error: " + (e?.stack || String(e)), 500);
   }
 }
 
-async function routeHelp(): Promise<Response> {
+async function routeHelp(url: URL): Promise<Response> {
   try {
     const argv: string[] = [];
     for (const d of DEFAULT_INIS) { argv.push("-d", d); }
@@ -469,20 +476,89 @@ async function routeHelp(): Promise<Response> {
       res = await runViaAutoRun(argv);
       res.debug.unshift("fallback:autoRun");
     }
-    const body = (res.stdout.join("\n") || res.stderr.join("\n") || "") + (res.debug.length ? `\ntrace:${res.debug.join("->")}` : "");
-    return textResponse(body || "", res.ok ? 200 : 500);
+    const out = (res.stdout.join("\n") || res.stderr.join("\n") || "");
+    const short = url.searchParams.get("short") === "1";
+    const body = short ? firstLines(out, 20) : out;
+    const trace = res.debug.length ? `\ntrace:${res.debug.join("->")}` : "";
+    return textResponse((body || "") + trace, res.ok ? 200 : 500);
   } catch (e: any) {
     return textResponse("routeHelp error: " + (e?.stack || String(e)), 500);
   }
 }
 
-async function routeNet(url: URL): Promise<Response> {
+// ——— Compact diagnostics ———
+async function routeCaps(): Promise<Response> {
   try {
-    const ref = url.searchParams.get("ref") || "main";
-    const test = await fetchGithubPhpSource("szzdmj", "wasmphp", "public/index.php", ref);
-    return new Response(JSON.stringify(test, null, 2), { status: test.ok ? 200 : 502, headers: { "content-type": "application/json; charset=utf-8" } });
+    const { php, debug } = await initPhpModule();
+    const caps = {
+      hasCallMain: typeof (php as any)?.callMain === "function",
+      hasRun: typeof (php as any)?.run === "function",
+      hasMain: typeof (php as any)?._main === "function",
+      hasFS: !!(php as any)?.FS,
+      hasCcall: typeof (php as any)?.ccall === "function",
+      hasCwrap: typeof (php as any)?.cwrap === "function",
+      wasmExportsKeys: Array.isArray((php as any)?.wasmExports ? Object.keys((php as any).wasmExports) : []) ? Object.keys((php as any).wasmExports).length : 0,
+      trace: debug,
+    };
+    return json(caps, 200);
   } catch (e: any) {
-    return textResponse("net error: " + (e?.stack || String(e)), 500);
+    return textResponse("caps error: " + (e?.stack || String(e)), 500);
+  }
+}
+
+async function routeSmoke(url: URL): Promise<Response> {
+  try {
+    const results: any = {};
+
+    // 1) auto-run + -r
+    {
+      const argv = buildArgvForCode("echo 'AA';");
+      const r = await runViaAutoRun(argv);
+      results.autoRun_r = {
+        ok: r.ok,
+        stdout: trimArr(r.stdout, 3),
+        stderr: trimArr(r.stderr, 3),
+        trace: r.debug,
+      };
+    }
+
+    // 2) callMain + -r
+    {
+      const argv = buildArgvForCode("echo 'BB';");
+      const r = await runViaCallMain(argv);
+      results.callMain_r = {
+        ok: r.ok,
+        stdout: trimArr(r.stdout, 3),
+        stderr: trimArr(r.stderr, 3),
+        trace: r.debug,
+        error: r.error || "",
+      };
+    }
+
+    // 3) callMain + -f (写入 MEMFS)
+    {
+      const path = "/tmp/t.php";
+      const argv = buildArgvForFile(path);
+      const r = await runViaCallMain(argv, 8000, (php) => {
+        try {
+          const FS = (php as any).FS;
+          if (!FS) return;
+          try { FS.mkdir("/tmp"); } catch {}
+          FS.writeFile(path, new TextEncoder().encode("<?php echo 'CC';"));
+        } catch {}
+      });
+      results.callMain_f = {
+        ok: r.ok,
+        stdout: trimArr(r.stdout, 3),
+        stderr: trimArr(r.stderr, 3),
+        trace: r.debug,
+        error: r.error || "",
+      };
+    }
+
+    return json(results, 200);
+  } catch (e: any) {
+    return textResponse("smoke error: " + (e?.stack || String(e)), 500);
   }
 }
 
@@ -507,7 +583,7 @@ export default {
             },
             importMeta: { available: typeof import.meta !== "undefined", url: importMetaUrl },
           };
-          return new Response(JSON.stringify(body, null, 2), { status: 200, headers: { "content-type": "application/json; charset=utf-8" } });
+          return json(body, 200);
         } catch (e: any) {
           return textResponse("probe error: " + (e?.stack || String(e)), 500);
         }
@@ -519,7 +595,7 @@ export default {
           const def = (mod as any)?.default ?? null;
           const hasFactory = typeof def === "function";
           const payload = { imported: true, hasDefaultFactory: hasFactory, exportKeys: Object.keys(mod || {}), note: "import-only, no init" };
-          return new Response(JSON.stringify(payload, null, 2), { status: 200, headers: { "content-type": "application/json; charset=utf-8" } });
+          return json(payload, 200);
         } catch (e: any) {
           return textResponse("Import glue failed:\n" + (e?.stack || String(e)), 500);
         }
@@ -527,9 +603,9 @@ export default {
 
       if (pathname === "/__mod") {
         try {
-          const { php, moduleOptions, stdout, stderr, debug } = await initPhpModule();
+          const { php, debug } = await initPhpModule();
           const summary = {
-            keys: php ? Object.keys(php) : [],
+            keysSample: Object.keys(php || {}).slice(0, 30),
             has: {
               callMain: typeof (php as any)?.callMain === "function",
               run: typeof (php as any)?.run === "function",
@@ -537,19 +613,27 @@ export default {
               cwrap: typeof (php as any)?.cwrap === "function",
               _main: typeof (php as any)?._main === "function",
               FS: !!(php as any)?.FS,
-              wasmExports: !!(php as any)?.wasmExports,
             },
             calledRun: (php as any)?.calledRun ?? undefined,
             trace: debug,
           };
-          return new Response(JSON.stringify(summary, null, 2), { status: 200, headers: { "content-type": "application/json; charset=utf-8" } });
+          return json(summary, 200);
         } catch (e: any) {
           return textResponse("mod error: " + (e?.stack || String(e)), 500);
         }
       }
 
+      if (pathname === "/__caps") return routeCaps();
+      if (pathname === "/__smoke") return routeSmoke(url);
+
       if (pathname === "/__net") {
-        return routeNet(url);
+        try {
+          const ref = url.searchParams.get("ref") || "main";
+          const test = await fetchGithubPhpSource("szzdmj", "wasmphp", "public/index.php", ref);
+          return json(test, test.ok ? 200 : 502);
+        } catch (e: any) {
+          return textResponse("net error: " + (e?.stack || String(e)), 500);
+        }
       }
 
       if (pathname === "/" || pathname === "/index.php" || pathname === "/info") {
@@ -567,12 +651,11 @@ export default {
         return routeRunPOST(request, url);
       }
 
-      if (pathname === "/version") return routeVersion();
-      if (pathname === "/help") return routeHelp();
+      if (pathname === "/version") return routeVersion(url);
+      if (pathname === "/help") return routeHelp(url);
 
       return textResponse("Not Found", 404);
     } catch (e: any) {
-      // Final guard against 1101
       return textResponse("Top-level handler error: " + (e?.stack || String(e)), 500);
     }
   },
