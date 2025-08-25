@@ -1,143 +1,125 @@
-// Cloudflare Workers friendly entry.
-// - Prefer precompiled WASM module via env.PHP_WASM to avoid runtime codegen.
-// - Keep probe and proxy routes. Falls back to network only if no binding is present.
+// 最小改动版：保留“动态导入 glue + 提供 wasmBinary”结构
+// - 在导入 glue 前补上 location/self polyfill，避免顶层 location.href 报错
+// - 如存在 env.PHP_WASM（wrangler 绑定的预编译 Module），通过 instantiateWasm 走“无运行时代码生成”路径
+// - 否则回退到 wasmBinary（在 Workers 上可能仍受平台限制）
 
-import createPHP from '../scripts/php_8_4_cf.js';
+import wasmBinary from "../scripts/php_8_4.wasm";
 
-const WASM_UPSTREAM = 'https://raw.githubusercontent.com/szzdmj/wasmphp/main/scripts/php_8_4.wasm';
-
-const SCRIPTS_PATH = '/scripts/php_8_4.wasm';
-const WASM_PATH = '/wasm/php_8_4.wasm';
-
-type FetchInfo = {
-  ok: boolean;
-  status: number;
-  headers: Record<string, string>;
-  error: string | null;
-};
-
-async function fetchInfo(urlStr: string): Promise<FetchInfo> {
-  try {
-    const r = await fetch(urlStr, { method: 'GET' });
-    const headers: Record<string, string> = {};
-    for (const [k, v] of r.headers) headers[k] = v;
-    return { ok: r.ok, status: r.status, headers, error: null };
-  } catch (e: any) {
-    return { ok: false, status: -1, headers: {}, error: e?.stack || String(e) };
+// 轻量 polyfill：在动态 import glue 之前可见
+{
+  const g = globalThis as any;
+  if (typeof g.location === "undefined" || typeof g.location?.href === "undefined") {
+    try {
+      Object.defineProperty(g, "location", {
+        value: { href: "file:///" },
+        configurable: true,
+        enumerable: false,
+        writable: false,
+      });
+    } catch {}
+  }
+  if (typeof g.self === "undefined") {
+    try {
+      Object.defineProperty(g, "self", {
+        value: g,
+        configurable: true,
+        enumerable: false,
+        writable: false,
+      });
+    } catch {}
+  } else if (typeof g.self.location === "undefined" && typeof g.location !== "undefined") {
+    try {
+      g.self.location = g.location;
+    } catch {}
   }
 }
 
-function textResponse(body: string, status = 200, headers: Record<string, string> = {}) {
-  return new Response(body, {
-    status,
-    headers: { 'content-type': 'text/plain; charset=utf-8', ...headers },
-  });
-}
-
-async function proxyWasm(upstream: string, routeName: 'scripts' | 'wasm') {
-  const r = await fetch(upstream, {
-    // @ts-ignore Cloudflare cache hint
-    cf: { cacheTtl: 300, cacheEverything: true },
-  });
-  if (!r.ok) {
-    return textResponse(`Upstream fetch failed: ${r.status}`, r.status, {
-      'x-worker-route': routeName,
-    });
-  }
-  const respHeaders = new Headers(r.headers);
-  respHeaders.set('content-type', 'application/wasm');
-  respHeaders.set('x-worker-route', routeName);
-  return new Response(r.body, { status: r.status, headers: respHeaders });
-}
-
-// Provide an instantiateWasm hook that uses a precompiled WebAssembly.Module binding.
 function makeInstantiateWithModule(wasmModule: WebAssembly.Module) {
-  return (info: WebAssembly.Imports /* imports */, receiveInstance: (i: WebAssembly.Instance) => void) => {
-    // Use synchronous instantiation so Emscripten can proceed immediately.
-    const instance = new WebAssembly.Instance(wasmModule, info);
-    // Returning exports synchronously is the Emscripten-supported fast path.
+  return (imports: WebAssembly.Imports /* imports */, _cb: (i: WebAssembly.Instance) => void) => {
+    // 仅实例化（不编译），符合 Emscripten 的同步返回导出接口
+    const instance = new WebAssembly.Instance(wasmModule, imports);
     return instance.exports as any;
   };
 }
 
 export default {
   async fetch(request: Request, env: any): Promise<Response> {
-    const url = new URL(request.url);
-    const { pathname, origin } = url;
-
-    // Proxy routes for external download/testing
-    if (pathname === SCRIPTS_PATH) {
-      return proxyWasm(WASM_UPSTREAM, 'scripts');
-    }
-    if (pathname === WASM_PATH) {
-      return proxyWasm(WASM_UPSTREAM, 'wasm');
-    }
-
-    // Probe endpoint to help diagnose environment/network
-    if (pathname === '/__probe') {
-      const upstream = await fetchInfo(WASM_UPSTREAM);
-      const originScripts = await fetchInfo(new URL(SCRIPTS_PATH, origin).toString());
-      const originWasm = await fetchInfo(new URL(WASM_PATH, origin).toString());
-      const hasBinding = typeof env?.PHP_WASM !== 'undefined';
-      const body = {
-        importMetaAvailable: typeof import.meta !== 'undefined',
-        hasBinding,
-        upstream,
-        originScripts,
-        originWasm,
-        note: hasBinding
-          ? 'WASM will be instantiated from binding (no runtime codegen).'
-          : 'No binding detected; runtime instantiation may be blocked by embedder.',
-      };
-      return new Response(JSON.stringify(body, null, 2), {
-        status: 200,
-        headers: { 'content-type': 'application/json; charset=utf-8' },
-      });
-    }
-
-    // Switches retained for non-binding fallback/testing:
-    // - ?inline=0 -> disable inline wasmBinary (use network via locateFile)
-    // - ?useUpstream=1 -> force upstream URL for locateFile
-    // - ?useOrigin=scripts|wasm -> force same-origin proxy route for locateFile
-    const inline = url.searchParams.get('inline') !== '0';
-    const useUpstream = url.searchParams.get('useUpstream') === '1';
-    const useOrigin = url.searchParams.get('useOrigin'); // 'scripts' | 'wasm' | null
-
-    const locateFile = (p: string) => {
-      if (!p.endsWith('.wasm')) return p;
-      if (useOrigin === 'scripts') return new URL(SCRIPTS_PATH, origin).toString();
-      if (useOrigin === 'wasm') return new URL(WASM_PATH, origin).toString();
-      if (useUpstream) return WASM_UPSTREAM;
-      return WASM_UPSTREAM;
-    };
-
     try {
-      const hasBinding = typeof env?.PHP_WASM !== 'undefined';
-      const opts: any = { locateFile };
-
-      if (hasBinding) {
-        // Use precompiled module binding to avoid runtime code generation.
-        opts.instantiateWasm = makeInstantiateWithModule(env.PHP_WASM as WebAssembly.Module);
-      } else if (inline) {
-        // Fallback: prefetch wasm and inline bytes (may still be blocked by embedder in some environments)
-        const wasmRes = await fetch(WASM_UPSTREAM, {
-          // @ts-ignore Cloudflare cache hint
-          cf: { cacheTtl: 300, cacheEverything: true },
+      const url = new URL(request.url);
+      const isPhpRoute = url.pathname === "/" || url.pathname === "/index.php";
+      if (!isPhpRoute) {
+        return new Response("PHP WASM initialized", {
+          headers: { "content-type": "text/plain; charset=utf-8" },
         });
-        if (!wasmRes.ok) {
-          return textResponse(`Failed to prefetch wasm: ${wasmRes.status}`, 500);
-        }
-        const buf = await wasmRes.arrayBuffer();
-        opts.wasmBinary = new Uint8Array(buf);
       }
 
-      const mod = await createPHP(opts);
-      return textResponse(
-        `Hello from PHP WASM (initialized). binding=${hasBinding ? 1 : 0}, inline=${inline ? 1 : 0}`,
-      );
+      // 仅动态导入 JS 模块，避免对巨大的 WASM 二进制做 __toESM 包装导致枚举属性
+      const phpModule = await import("../scripts/php_8_4.js");
+
+      // 兼容不同导出方式，优先取 init，其次 default，其次模块本身
+      const initCandidate =
+        (phpModule as any).init ||
+        (phpModule as any).default ||
+        (phpModule as any);
+
+      if (typeof initCandidate !== "function") {
+        return new Response("Runtime error: PHP init function not found on module export", {
+          status: 500,
+          headers: { "content-type": "text/plain; charset=utf-8" },
+        });
+      }
+
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+
+      // 等待 Emscripten 运行时就绪
+      let resolveReady: () => void = () => {};
+      const runtimeReady = new Promise<void>((res) => { resolveReady = res; });
+
+      const moduleOptions: any = {
+        wasmBinary,           // 你的原始思路：提供字节，非路径
+        noInitialRun: true,
+        print: (txt: string) => { try { stdout.push(String(txt)); } catch {} },
+        printErr: (txt: string) => { try { stderr.push(String(txt)); } catch {} },
+        onRuntimeInitialized: () => { try { resolveReady(); } catch {} },
+      };
+
+      // 若存在部署期预编译的 Module 绑定，则完全避免运行时代码生成
+      if (typeof env?.PHP_WASM !== "undefined") {
+        moduleOptions.instantiateWasm = makeInstantiateWithModule(env.PHP_WASM as WebAssembly.Module);
+      }
+
+      // 尝试两种 init 签名：单参与带 "WORKER"
+      let php: any;
+      try {
+        php = await (initCandidate as any)(moduleOptions);
+      } catch {
+        php = await (initCandidate as any)("WORKER", moduleOptions);
+      }
+
+      // 确保运行时完全就绪
+      await runtimeReady;
+
+      // 完全绕过 FS，仅执行内联 phpinfo()
+      try {
+        php.callMain(["-r", "phpinfo();"]);
+      } catch (e: any) {
+        if (e?.message) stderr.push("[callMain] " + e.message);
+      }
+
+      const body = stdout.length ? stdout.join("\n") : (stderr.length ? stderr.join("\n") : "");
+      const status = stdout.length ? 200 : (stderr.length ? 500 : 204);
+
+      return new Response(body, {
+        status,
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
     } catch (e: any) {
-      const detail = e?.stack || String(e);
-      return textResponse(`Initialization error:\n${detail}`, 500);
+      const msg = e?.stack || e?.message || String(e);
+      return new Response("Runtime error: " + msg, {
+        status: 500,
+        headers: { "content-type": "text/plain; charset=utf-8" },
+      });
     }
   },
 };
