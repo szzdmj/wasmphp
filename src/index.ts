@@ -1,9 +1,11 @@
-// V66b: Fix build error, hardened against 1101, safer GitHub fetch, raw view for /public,
-// stderr noise filtering, default JIT disabled, and full try/catch guards.
+// V66c: fix 204-with-body error by avoiding 204/205/304 entirely, keep hardened behavior.
+// - Always return 200 when successful (even with empty body), 500 on errors.
+// - Shared finalize() helper to build safe responses.
+// - Keep: default JIT disabled, stderr noise filtering, __net, /public raw, full try/catch.
 
 import wasmAsset from "../scripts/php_8_4.wasm";
 
-// Minimal globals to satisfy Emscripten glue in Workers
+// Minimal globals for Emscripten glue in Workers
 (function ensureGlobals() {
   const g = globalThis as any;
   if (typeof g.location === "undefined" || typeof g.location?.href === "undefined") {
@@ -30,6 +32,16 @@ const DEFAULT_INIS = [
   "display_startup_errors=1",
 ];
 
+type RunResult = {
+  ok: boolean;
+  stdout: string[];
+  stderr: string[];
+  debug: string[];
+  exitStatus?: number;
+  php?: any;
+  error?: string;
+};
+
 function isWasmModule(x: any): x is WebAssembly.Module {
   return Object.prototype.toString.call(x) === "[object WebAssembly.Module]";
 }
@@ -45,16 +57,6 @@ function makeInstantiateWithModule(wasmModule: WebAssembly.Module) {
 function textResponse(body: string, status = 200, headers: Record<string, string> = {}) {
   return new Response(body, { status, headers: { "content-type": "text/plain; charset=utf-8", ...headers } });
 }
-
-type RunResult = {
-  ok: boolean;
-  stdout: string[];
-  stderr: string[];
-  debug: string[];
-  exitStatus?: number;
-  php?: any;
-  error?: string;
-};
 
 function parseIniParams(url: URL): string[] {
   const out: string[] = [];
@@ -172,6 +174,7 @@ async function createPhpModuleAndRun(argv: string[], waitMs = 8000): Promise<Run
   }
 }
 
+// stderr noise filtering
 function filterKnownNoise(lines: string[], keepAll: boolean) {
   if (keepAll) return { kept: lines.slice(), ignored: 0 };
   const patterns: RegExp[] = [/^munmap\(\)\s+failed:\s+\[\d+\]\s+Invalid argument/i];
@@ -190,6 +193,23 @@ function filterKnownNoise(lines: string[], keepAll: boolean) {
 function inferContentTypeFromOutput(stdout: string, fallback = "text/plain; charset=utf-8") {
   if (stdout.includes("<html") || stdout.includes("<!DOCTYPE html")) return "text/html; charset=utf-8";
   return fallback;
+}
+
+// Unified finalizer to avoid 204-with-body
+function finalizeOk(url: URL, res: RunResult, defaultCT: string) {
+  const debugMode = url.searchParams.get("debug") === "1" || url.searchParams.get("showstderr") === "1";
+  const stdout = res.stdout.join("\n");
+  const { kept: errKept } = filterKnownNoise(res.stderr, debugMode);
+  const err = errKept.join("\n");
+  const ct = inferContentTypeFromOutput(stdout, defaultCT);
+  const trace = res.debug.length ? `\n<!-- trace:${res.debug.join("->")} -->` : "";
+  const body = (stdout || err) ? (stdout || err) + trace : "";
+
+  // Never return 204/205/304. Use 200 if ok, 500 only when we explicitly return errors elsewhere.
+  const status = (stdout || err) ? (stdout ? 200 : 500) : 200;
+
+  // If body is empty, still safe to return 200 with empty body.
+  return new Response(body, { status, headers: { "content-type": ct } });
 }
 
 // ——— GitHub Raw helpers ———
@@ -215,7 +235,6 @@ async function fetchGithubPhpSource(owner: string, repo: string, path: string, r
       const txt = await res.text();
       return { ok: true, code: normalizePhpCodeForEval(txt), status: res.status };
     }
-    // fallback: master
     if (branch !== "master") {
       const u2 = `https://raw.githubusercontent.com/${owner}/${repo}/master/${path.replace(/^\/+/, "")}`;
       res = await fetch(u2, { method: "GET", headers });
@@ -235,19 +254,11 @@ async function routeInfo(url: URL): Promise<Response> {
   try {
     const argv = buildArgvForCode("phpinfo();");
     const res = await createPhpModuleAndRun(argv);
-    const debugMode = url.searchParams.get("debug") === "1" || url.searchParams.get("showstderr") === "1";
     if (!res.ok) {
       const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
       return textResponse(body, 500);
     }
-    const stdout = res.stdout.join("\n");
-    const { kept: errKept } = filterKnownNoise(res.stderr, debugMode);
-    const err = errKept.join("\n");
-    const ct = inferContentTypeFromOutput(stdout, "text/html; charset=utf-8");
-    const trace = res.debug.length ? `\n<!-- trace:${res.debug.join("->")} -->` : "";
-    const body = (stdout || err || "") + trace;
-    const status = stdout ? 200 : err ? 500 : typeof res.exitStatus === "number" ? (res.exitStatus === 0 ? 204 : 500) : 204;
-    return new Response(body, { status, headers: { "content-type": ct } });
+    return finalizeOk(url, res, "text/html; charset=utf-8");
   } catch (e: any) {
     return textResponse("routeInfo error: " + (e?.stack || String(e)), 500);
   }
@@ -261,20 +272,11 @@ async function routeRunGET(url: URL): Promise<Response> {
     const ini = parseIniParams(url);
     const argv = buildArgvForCode(codeRaw, ini);
     const res = await createPhpModuleAndRun(argv);
-    const debugMode = url.searchParams.get("debug") === "1" || url.searchParams.get("showstderr") === "1";
-
     if (!res.ok) {
       const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
       return textResponse(body, 500);
     }
-    const stdout = res.stdout.join("\n");
-    const { kept: errKept } = filterKnownNoise(res.stderr, debugMode);
-    const err = errKept.join("\n");
-    const ct = inferContentTypeFromOutput(stdout);
-    const trace = res.debug.length ? `\n<!-- trace:${res.debug.join("->")} -->` : "";
-    const body = (stdout || err || "") + trace;
-    const status = stdout ? 200 : err ? 500 : typeof res.exitStatus === "number" ? (res.exitStatus === 0 ? 204 : 500) : 204;
-    return new Response(body, { status, headers: { "content-type": ct } });
+    return finalizeOk(url, res, "text/plain; charset=utf-8");
   } catch (e: any) {
     return textResponse("routeRunGET error: " + (e?.stack || String(e)), 500);
   }
@@ -288,20 +290,11 @@ async function routeRunPOST(request: Request, url: URL): Promise<Response> {
     const ini = parseIniParams(url);
     const argv = buildArgvForCode(code, ini);
     const res = await createPhpModuleAndRun(argv, 10000);
-    const debugMode = url.searchParams.get("debug") === "1" || url.searchParams.get("showstderr") === "1";
-
     if (!res.ok) {
       const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
       return textResponse(body, 500);
     }
-    const stdout = res.stdout.join("\n");
-    const { kept: errKept } = filterKnownNoise(res.stderr, debugMode);
-    const err = errKept.join("\n");
-    const ct = inferContentTypeFromOutput(stdout);
-    const trace = res.debug.length ? `\n<!-- trace:${res.debug.join("->")} -->` : "";
-    const body = (stdout || err || "") + trace;
-    const status = stdout ? 200 : err ? 500 : typeof res.exitStatus === "number" ? (res.exitStatus === 0 ? 204 : 500) : 204;
-    return new Response(body, { status, headers: { "content-type": ct } });
+    return finalizeOk(url, res, "text/plain; charset=utf-8");
   } catch (e: any) {
     return textResponse("routeRunPOST error: " + (e?.stack || String(e)), 500);
   }
@@ -315,27 +308,17 @@ async function routeRepoIndex(url: URL): Promise<Response> {
     if (!pull.ok) return textResponse(pull.err || "Fetch error", 502);
 
     if (mode === "raw") {
-      // Show the raw PHP (normalized) without executing
       return new Response(pull.code || "", { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
     }
 
     const ini = parseIniParams(url);
     const argv = buildArgvForCode(pull.code!, ini);
     const res = await createPhpModuleAndRun(argv, 10000);
-    const debugMode = url.searchParams.get("debug") === "1" || url.searchParams.get("showstderr") === "1";
-
     if (!res.ok) {
       const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
       return textResponse(body, 500);
     }
-    const stdout = res.stdout.join("\n");
-    const { kept: errKept } = filterKnownNoise(res.stderr, debugMode);
-    const err = errKept.join("\n");
-    const ct = inferContentTypeFromOutput(stdout, "text/html; charset=utf-8");
-    const trace = res.debug.length ? `\n<!-- trace:${res.debug.join("->")} -->` : "";
-    const body = (stdout || err || "") + trace;
-    const status = stdout ? 200 : err ? 500 : typeof res.exitStatus === "number" ? (res.exitStatus === 0 ? 204 : 500) : 204;
-    return new Response(body, { status, headers: { "content-type": ct } });
+    return finalizeOk(url, res, "text/html; charset=utf-8");
   } catch (e: any) {
     return textResponse("routeRepoIndex error: " + (e?.stack || String(e)), 500);
   }
@@ -468,7 +451,7 @@ export default {
 
       return textResponse("Not Found", 404);
     } catch (e: any) {
-      // Final guard against 1101: never throw out of fetch()
+      // Final guard against 1101
       return textResponse("Top-level handler error: " + (e?.stack || String(e)), 500);
     }
   },
