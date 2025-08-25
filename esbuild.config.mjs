@@ -6,7 +6,8 @@ build({
   outfile: "dist/worker.js",
   platform: "browser",
   target: "esnext",
-  loader: { ".dat": "file", ".wasm": "file" },
+  // 关键点：让 import "../scripts/php_8_4.wasm" 变成 Uint8Array（匹配 index.ts 中的 wasmBinary）
+  loader: { ".dat": "file", ".wasm": "binary" },
   external: [
     "@php-wasm/web/php/asyncify/8_4_10/php_8_4.js",
     "@php-wasm/web/php/asyncify/8_4_10/php_8_4.wasm",
