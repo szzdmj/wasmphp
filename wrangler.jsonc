@@ -6,9 +6,6 @@
   "tsconfig": "tsconfig.json",
   "observability": { "enabled": true },
   "r2_buckets": [
-    {
-      "binding": "SRC",
-      "bucket_name": "php-src"
-    }
+    { "binding": "SRC", "bucket_name": "php-src" }
   ]
 }
