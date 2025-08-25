@@ -1,10 +1,4 @@
-// V66k (stable): Auto-run only + reliable stdout flush for -r by register_shutdown_function("\n").
-// - All executions use noInitialRun=false + Module.arguments (module only has _main; no FS/callMain).
-// - For -r, prepend: register_shutdown_function(function(){echo "\n";});
-// - /public/index.php executes eval(base64_decode(...)) with the same shutdown flush.
-// - Home route ("/" and "/index.php") now renders repo's /public/index.php content.
-// - Keep: stderr noise filtering, helpful empty-output hint, __net, raw mode, 1101 guard.
-
+// V66k + R2: 在 V66k 基础上增加 R2 源码读取（默认 key=public/index.php）
 import wasmAsset from "../scripts/php_8_4.wasm";
 
 // Minimal globals for Emscripten glue in Workers
@@ -204,15 +198,28 @@ function finalizeOk(url: URL, res: RunResult, defaultCT: string) {
   return new Response(body, { status, headers: { "content-type": ct } });
 }
 
-// ——— GitHub Raw helpers ———
+// —— Sources: R2 first, then GitHub fallback ——
 function normalizePhpCodeForEval(src: string): string {
   let s = src.trimStart();
-  // Remove UTF-8 BOM if present
   if (s.charCodeAt(0) === 0xfeff) s = s.slice(1);
   if (s.startsWith("<?php")) s = s.slice(5);
   else if (s.startsWith("<?")) s = s.slice(2);
   s = s.replace(/\?>\s*$/s, "");
   return s;
+}
+
+async function fetchR2PhpSource(env: any, key: string): Promise<{ ok: boolean; code?: string; err?: string }> {
+  try {
+    if (!env || !env.SRC || typeof env.SRC.get !== "function") {
+      return { ok: false, err: "R2 binding SRC is not configured" };
+    }
+    const obj = await env.SRC.get(key);
+    if (!obj) return { ok: false, err: `R2 object not found: ${key}` };
+    const txt = await obj.text();
+    return { ok: true, code: normalizePhpCodeForEval(txt) };
+  } catch (e: any) {
+    return { ok: false, err: "R2 get failed: " + (e?.message || String(e)) };
+  }
 }
 
 async function fetchGithubPhpSource(owner: string, repo: string, path: string, ref?: string): Promise<{ ok: boolean; code?: string; err?: string; status?: number }> {
@@ -270,7 +277,6 @@ async function routeInfo(url: URL): Promise<Response> {
 }
 
 function wrapCodeWithShutdownNewline(code: string): string {
-  // Ensure a newline is emitted at shutdown to flush line-buffered stdout in Emscripten
   return `register_shutdown_function(function(){echo "\\n";}); ${code}`;
 }
 
@@ -310,22 +316,36 @@ async function routeRunPOST(request: Request, url: URL): Promise<Response> {
   }
 }
 
-async function routeRepoIndex(url: URL): Promise<Response> {
+async function routeRepoIndex(url: URL, env: any): Promise<Response> {
   try {
     const ref = url.searchParams.get("ref") || undefined;
     const mode = url.searchParams.get("mode") || "";
-    const pull = await fetchGithubPhpSource("szzdmj", "wasmphp", "public/index.php", ref);
-    if (!pull.ok) return textResponse(pull.err || "Fetch error", 502);
+    const key = url.searchParams.get("key") || "public/index.php";
 
-    if (mode === "raw") {
-      return new Response(pull.code || "", { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+    // 1) 优先从 R2 读
+    let codeNormalized: string | undefined;
+    if (env && env.SRC) {
+      const r2 = await fetchR2PhpSource(env, key);
+      if (r2.ok) codeNormalized = r2.code!;
     }
 
-    // Execute via base64-eval + shutdown newline to force flush
-    const codeNormalized = pull.code || "";
-    const b64 = toBase64Utf8(codeNormalized);
-    const oneLiner = wrapCodeWithShutdownNewline(`eval(base64_decode('${b64}'));`);
+    // 2) R2 没拿到则回退 GitHub（保持原来的容灾）
+    if (!codeNormalized) {
+      const pull = await fetchGithubPhpSource("szzdmj", "wasmphp", key, ref);
+      if (!pull.ok) return textResponse(pull.err || "Fetch error", 502);
+      codeNormalized = pull.code || "";
+      if (mode === "raw") {
+        return new Response(codeNormalized, { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+      }
+    } else {
+      if (mode === "raw") {
+        return new Response(codeNormalized, { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+      }
+    }
 
+    // 执行：base64-eval + shutdown newline 强制 flush
+    const b64 = toBase64Utf8(codeNormalized || "");
+    const oneLiner = wrapCodeWithShutdownNewline(`eval(base64_decode('${b64}'));`);
     const ini = parseIniParams(url);
     const argv = buildArgvForCode(oneLiner, ini);
     const res = await runAuto(argv, 10000);
@@ -365,18 +385,18 @@ async function routeHelp(): Promise<Response> {
   }
 }
 
-async function routeNet(url: URL): Promise<Response> {
+async function routeNet(url: URL, env: any): Promise<Response> {
   try {
-    const ref = url.searchParams.get("ref") || "main";
-    const test = await fetchGithubPhpSource("szzdmj", "wasmphp", "public/index.php", ref);
-    return new Response(JSON.stringify(test, null, 2), { status: test.ok ? 200 : 502, headers: { "content-type": "application/json; charset=utf-8" } });
+    const key = url.searchParams.get("key") || "public/index.php";
+    const r2 = await fetchR2PhpSource(env, key);
+    return new Response(JSON.stringify(r2, null, 2), { status: r2.ok ? 200 : 502, headers: { "content-type": "application/json; charset=utf-8" } });
   } catch (e: any) {
     return textResponse("net error: " + (e?.stack || String(e)), 500);
   }
 }
 
 export default {
-  async fetch(request: Request): Promise<Response> {
+  async fetch(request: Request, env: any): Promise<Response> {
     try {
       const url = new URL(request.url);
       const { pathname } = url;
@@ -393,6 +413,7 @@ export default {
               hasWorkerCtor: typeof (globalThis as any).Worker !== "undefined",
               hasSharedArrayBuffer: typeof (globalThis as any).SharedArrayBuffer !== "undefined",
               userAgent: (globalThis as any).navigator?.userAgent ?? null,
+              hasR2: !!env?.SRC,
             },
             importMeta: { available: typeof import.meta !== "undefined", url: importMetaUrl },
           };
@@ -415,12 +436,12 @@ export default {
       }
 
       if (pathname === "/__net") {
-        return routeNet(url);
+        return routeNet(url, env);
       }
 
-      // Home: render repo's /public/index.php
+      // Home: render repo's /public/index.php from R2 (fallback GitHub)
       if (pathname === "/" || pathname === "/index.php") {
-        return routeRepoIndex(url);
+        return routeRepoIndex(url, env);
       }
 
       // phpinfo on /info
@@ -429,7 +450,7 @@ export default {
       }
 
       if (pathname === "/public/index.php") {
-        return routeRepoIndex(url);
+        return routeRepoIndex(url, env);
       }
 
       if (pathname === "/run" && request.method === "GET") {
