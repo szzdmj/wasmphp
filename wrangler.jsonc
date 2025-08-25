@@ -1,19 +1,14 @@
 {
-  // 基本信息
   "name": "wasmphp",
   "main": "src/index.ts",
   "compatibility_date": "2025-08-23",
-
-  // 可选：更小的脚本体积与线上可观测性
   "minify": true,
   "tsconfig": "tsconfig.json",
   "observability": { "enabled": true },
-
-  // 绑定 R2 桶：把 bucket_name 改成你实际创建的 R2 桶名
   "r2_buckets": [
     {
-      "binding": "SRC",          // 代码里通过 env.SRC 访问
-      "bucket_name": "php-src"   // 你的 R2 桶名（示例：php-src）
+      "binding": "SRC",
+      "bucket_name": "php-src"
     }
   ]
 }
