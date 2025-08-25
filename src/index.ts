@@ -1,5 +1,5 @@
-// V66f: Execute /public/index.php by writing to MEMFS and running "php -f /tmp/public_index.php".
-// Keep: hardened against 1101, stderr noise filtering, default JIT disabled, __net, /public raw, full try/catch.
+// V66g: switch to explicit callMain() and write MEMFS after init (no preRun), fix "Could not open input file" and no-output.
+// Keep: hardened against 1101, stderr noise filtering, default JIT disabled, __net, /public raw, helpful empty-output hint.
 
 import wasmAsset from "../scripts/php_8_4.wasm";
 
@@ -82,10 +82,10 @@ function buildArgvForFile(path: string, iniList: string[] = []): string[] {
   return argv;
 }
 
-async function buildModuleOptions(argv: string[], preRun?: (mod: any) => void) {
+async function buildModuleOptions() {
   const opts: any = {
-    noInitialRun: false,
-    arguments: argv.slice(),
+    // We will call callMain() explicitly.
+    noInitialRun: true,
     print: () => {},
     printErr: () => {},
     onRuntimeInitialized: () => {},
@@ -94,11 +94,6 @@ async function buildModuleOptions(argv: string[], preRun?: (mod: any) => void) {
       (opts as any).__exitThrown = toThrow ? String(toThrow) : "";
     },
   };
-
-  if (preRun) {
-    // Emscripten will call functions in preRun before main()
-    opts.preRun = [preRun];
-  }
 
   if (isWasmModule(wasmAsset)) {
     opts.instantiateWasm = makeInstantiateWithModule(wasmAsset as WebAssembly.Module);
@@ -127,7 +122,7 @@ async function buildModuleOptions(argv: string[], preRun?: (mod: any) => void) {
   throw new Error("Unsupported wasm asset type at runtime");
 }
 
-async function createPhpModuleAndRun(argv: string[], waitMs = 8000, preRun?: (mod: any) => void): Promise<RunResult> {
+async function createPhpModuleAndRunExplicit(argv: string[], waitMs = 8000, afterInit?: (php: any) => void): Promise<RunResult> {
   const debug: string[] = [];
   const stdout: string[] = [];
   const stderr: string[] = [];
@@ -144,7 +139,7 @@ async function createPhpModuleAndRun(argv: string[], waitMs = 8000, preRun?: (mo
     }
 
     debug.push("step:build-options");
-    const moduleOptions: any = await buildModuleOptions(argv, preRun);
+    const moduleOptions: any = await buildModuleOptions();
     moduleOptions.print = (txt: string) => { try { stdout.push(String(txt)); } catch {} };
     moduleOptions.printErr = (txt: string) => { try { stderr.push(String(txt)); } catch {} };
     moduleOptions.onRuntimeInitialized = () => { debug.push("event:onRuntimeInitialized"); };
@@ -164,19 +159,52 @@ async function createPhpModuleAndRun(argv: string[], waitMs = 8000, preRun?: (mo
       }
     }
 
-    debug.push("step:await-output");
+    // Allow caller to manipulate FS before running main
+    if (afterInit) {
+      try { afterInit(php); } catch (e: any) { stderr.push("afterInit error: " + (e?.message || String(e))); }
+    }
+
+    // Build full argv with a fake program name
+    const fullArgv = ["php", ...argv];
+
+    debug.push("step:callMain");
+    let ran = false;
+    try {
+      if (typeof (php as any).callMain === "function") {
+        (php as any).callMain(fullArgv);
+        ran = true;
+        debug.push("callMain:ok");
+      }
+    } catch (e: any) {
+      stderr.push("callMain threw: " + (e?.message || String(e)));
+    }
+
+    if (!ran && typeof (php as any).run === "function") {
+      try {
+        // Some builds honor Module.arguments; supply and run()
+        (php as any).arguments = fullArgv.slice(1); // run() often ignores the program name
+        (php as any).run();
+        ran = true;
+        debug.push("run():ok");
+      } catch (e: any) {
+        stderr.push("run() threw: " + (e?.message || String(e)));
+      }
+    }
+
+    if (!ran) {
+      return { ok: false, stdout, stderr, debug, error: "No runnable entry point (callMain/run) found on Module." };
+    }
+
+    // Wait briefly to ensure prints are flushed and quit captured
     const start = Date.now();
     while (Date.now() - start < waitMs) {
-      if (typeof (php as any).calledRun !== "undefined") {
-        debug.push("probe:calledRun=" + String((php as any).calledRun));
-      }
       if (typeof moduleOptions.__exitStatus === "number") {
         exitStatus = moduleOptions.__exitStatus;
         debug.push("exit:" + String(exitStatus));
         break;
       }
       if (stdout.length > 0) break;
-      await new Promise((r) => setTimeout(r, 50));
+      await new Promise((r) => setTimeout(r, 25));
     }
 
     return { ok: true, stdout, stderr, debug, php, exitStatus };
@@ -206,7 +234,7 @@ function inferContentTypeFromOutput(stdout: string, fallback = "text/plain; char
   return fallback;
 }
 
-// Unified finalizer
+// Unified finalizer with diagnostics when both stdout/stderr are empty
 function finalizeOk(url: URL, res: RunResult, defaultCT: string) {
   const debugMode = url.searchParams.get("debug") === "1" || url.searchParams.get("showstderr") === "1";
   const stdout = res.stdout.join("\n");
@@ -281,7 +309,7 @@ async function fetchGithubPhpSource(owner: string, repo: string, path: string, r
 async function routeInfo(url: URL): Promise<Response> {
   try {
     const argv = buildArgvForCode("phpinfo();");
-    const res = await createPhpModuleAndRun(argv);
+    const res = await createPhpModuleAndRunExplicit(argv);
     if (!res.ok) {
       const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
       return textResponse(body, 500);
@@ -299,7 +327,7 @@ async function routeRunGET(url: URL): Promise<Response> {
     if (codeRaw.length > 64 * 1024) return textResponse("Payload Too Large", 413);
     const ini = parseIniParams(url);
     const argv = buildArgvForCode(codeRaw, ini);
-    const res = await createPhpModuleAndRun(argv);
+    const res = await createPhpModuleAndRunExplicit(argv);
     if (!res.ok) {
       const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
       return textResponse(body, 500);
@@ -317,7 +345,7 @@ async function routeRunPOST(request: Request, url: URL): Promise<Response> {
     if (code.length > 256 * 1024) return textResponse("Payload Too Large", 413);
     const ini = parseIniParams(url);
     const argv = buildArgvForCode(code, ini);
-    const res = await createPhpModuleAndRun(argv, 10000);
+    const res = await createPhpModuleAndRunExplicit(argv, 10000);
     if (!res.ok) {
       const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
       return textResponse(body, 500);
@@ -344,19 +372,18 @@ async function routeRepoIndex(url: URL): Promise<Response> {
     const ini = parseIniParams(url);
     const argv = buildArgvForFile(filePath, ini);
 
-    const preRun = (mod: any) => {
+    const res = await createPhpModuleAndRunExplicit(argv, 10000, (php) => {
       try {
-        const FS = mod.FS || (mod.Module && mod.Module.FS);
+        const FS = (php as any).FS;
         if (!FS) return;
         try { FS.mkdir("/tmp"); } catch {}
         const bytes = new TextEncoder().encode(codeNormalized);
         FS.writeFile(filePath, bytes);
       } catch (e) {
-        // Swallow; execution will fail and be reported in stderr/stdout
+        // swallow; error will surface if file missing
       }
-    };
+    });
 
-    const res = await createPhpModuleAndRun(argv, 10000, preRun);
     if (!res.ok) {
       const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
       return textResponse(body, 500);
@@ -372,7 +399,7 @@ async function routeVersion(): Promise<Response> {
     const argv: string[] = [];
     for (const d of DEFAULT_INIS) { argv.push("-d", d); }
     argv.push("-v");
-    const res = await createPhpModuleAndRun(argv);
+    const res = await createPhpModuleAndRunExplicit(argv);
     const body = (res.stdout.join("\n") || res.stderr.join("\n") || "") + (res.debug.length ? `\ntrace:${res.debug.join("->")}` : "");
     return textResponse(body || "", res.ok ? 200 : 500);
   } catch (e: any) {
@@ -385,7 +412,7 @@ async function routeHelp(): Promise<Response> {
     const argv: string[] = [];
     for (const d of DEFAULT_INIS) { argv.push("-d", d); }
     argv.push("-h");
-    const res = await createPhpModuleAndRun(argv);
+    const res = await createPhpModuleAndRunExplicit(argv);
     const body = (res.stdout.join("\n") || res.stderr.join("\n") || "") + (res.debug.length ? `\ntrace:${res.debug.join("->")}` : "");
     return textResponse(body || "", res.ok ? 200 : 500);
   } catch (e: any) {
@@ -445,7 +472,7 @@ export default {
       if (pathname === "/__mod") {
         try {
           const argv = buildArgvForCode("echo 'ok';");
-          const res = await createPhpModuleAndRun(argv);
+          const res = await createPhpModuleAndRunExplicit(argv);
           const summary = res.ok
             ? {
                 keys: res.php ? Object.keys(res.php) : [],
