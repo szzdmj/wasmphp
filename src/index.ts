@@ -320,7 +320,7 @@ async function routeRepoIndex(url: URL, env: any): Promise<Response> {
   try {
     const ref = url.searchParams.get("ref") || undefined;
     const mode = url.searchParams.get("mode") || "";
-    const key = url.searchParams.get("key") || "public/index.php";
+    const key = url.searchParams.get("key") || "index.php";
 
     // 1) 优先从 R2 读
     let codeNormalized: string | undefined;
