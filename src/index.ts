@@ -1,7 +1,5 @@
-// V66c: fix 204-with-body error by avoiding 204/205/304 entirely, keep hardened behavior.
-// - Always return 200 when successful (even with empty body), 500 on errors.
-// - Shared finalize() helper to build safe responses.
-// - Keep: default JIT disabled, stderr noise filtering, __net, /public raw, full try/catch.
+// V66d: when PHP produces no stdout/stderr, return a helpful message instead of a blank body.
+// Keep: hardened against 1101, stderr noise filtering, default JIT disabled, __net, /public raw, full try/catch.
 
 import wasmAsset from "../scripts/php_8_4.wasm";
 
@@ -195,26 +193,45 @@ function inferContentTypeFromOutput(stdout: string, fallback = "text/plain; char
   return fallback;
 }
 
-// Unified finalizer to avoid 204-with-body
+// Unified finalizer to avoid 204-with-body and provide helpful diagnostics on empty output
 function finalizeOk(url: URL, res: RunResult, defaultCT: string) {
   const debugMode = url.searchParams.get("debug") === "1" || url.searchParams.get("showstderr") === "1";
   const stdout = res.stdout.join("\n");
-  const { kept: errKept } = filterKnownNoise(res.stderr, debugMode);
-  const err = errKept.join("\n");
+  const filtered = filterKnownNoise(res.stderr, debugMode);
+  const err = filtered.kept.join("\n");
   const ct = inferContentTypeFromOutput(stdout, defaultCT);
   const trace = res.debug.length ? `\n<!-- trace:${res.debug.join("->")} -->` : "";
-  const body = (stdout || err) ? (stdout || err) + trace : "";
 
-  // Never return 204/205/304. Use 200 if ok, 500 only when we explicitly return errors elsewhere.
-  const status = (stdout || err) ? (stdout ? 200 : 500) : 200;
+  let body = "";
+  let status = 200;
 
-  // If body is empty, still safe to return 200 with empty body.
+  if (stdout) {
+    body = stdout + trace;
+  } else if (err) {
+    body = err + trace;
+    status = 500;
+  } else {
+    // No stdout nor stderr: show a small hint to help diagnose
+    const hint = [
+      "[wasmphp] No output from PHP script.",
+      `exitStatus=${typeof res.exitStatus === "number" ? res.exitStatus : "unknown"}`,
+      `stderr_filtered_lines=${filtered.ignored}`,
+      res.debug.length ? `trace=${res.debug.join("->")}` : "",
+      "Tip: append ?debug=1 to see unfiltered stderr.",
+    ].filter(Boolean).join("\n");
+    body = hint;
+    // Keep 200; this is not a hard error, just informative
+    status = 200;
+  }
+
   return new Response(body, { status, headers: { "content-type": ct } });
 }
 
 // ——— GitHub Raw helpers ———
 function normalizePhpCodeForEval(src: string): string {
   let s = src.trimStart();
+  // Remove UTF-8 BOM if present
+  if (s.charCodeAt(0) === 0xfeff) s = s.slice(1);
   if (s.startsWith("<?php")) s = s.slice(5);
   else if (s.startsWith("<?")) s = s.slice(2);
   s = s.replace(/\?>\s*$/s, "");
