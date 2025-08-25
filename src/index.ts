@@ -1,8 +1,8 @@
-// V31 执行版（兼容回退 + 诊断）：在“单线程”构建前提下运行 phpinfo()
-// - ESM 直接导入 .wasm（Wrangler 产出 WebAssembly.Module）
-// - instantiateWasm 同步实例化，并调用 successCallback
-// - 优先使用 callMain；若无则回退 run + Module.arguments
-// - 提供 /__probe /__jsplus /__mod 诊断路由
+// V32 执行版（Minimal Runtime 适配）
+// 结论：glue 不导出 callMain/run/ccall/cwrap，但导出了 _main。
+// 方案：把 noInitialRun=false 与 arguments 传给工厂函数，
+//       让 Emscripten 在初始化阶段自动执行 main(argv)，我们只收集输出。
+// 保留 /__probe /__jsplus /__mod 诊断路由。
 
 import wasmAsset from "../scripts/php_8_4.wasm";
 
@@ -57,13 +57,20 @@ function textResponse(body: string, status = 200, headers: Record<string, string
   });
 }
 
-async function buildModuleOptions(): Promise<any> {
+async function buildModuleOptions(argv: string[]) {
+  // 注意：noInitialRun=false 让 Emscripten 在初始化完成后自动执行 main(argv)
   const opts: any = {
-    noInitialRun: true, // 我们手动触发
+    noInitialRun: false,
+    arguments: argv.slice(),
     print: () => {},
     printErr: () => {},
     onRuntimeInitialized: () => {},
-    arguments: ["-r", "phpinfo();"], // 供 run 回退使用
+    // 捕获退出码，防止直接抛异常导致 1101
+    quit: (status: number, toThrow?: any) => {
+      // Emscripten 会在 exit 时调用 quit；我们不抛错，记录状态即可
+      (opts as any).__exitStatus = status;
+      (opts as any).__exitThrown = toThrow ? String(toThrow) : "";
+    },
   };
 
   if (isWasmModule(wasmAsset)) {
@@ -93,141 +100,130 @@ async function buildModuleOptions(): Promise<any> {
   throw new Error("Unsupported wasm asset type at runtime");
 }
 
-async function createPhpModule(debug: string[], stdout: string[], stderr: string[]) {
-  debug.push("step:import-glue");
-  const phpModule = await import("../scripts/php_8_4.js");
-  const initCandidate =
-    (phpModule as any).init || (phpModule as any).default || (phpModule as any);
-
-  if (typeof initCandidate !== "function") {
-    throw new Error(
-      "PHP init function not found on module export. " +
-        "Hint: ensure -s MODULARIZE=1 -s EXPORT_ES6=1. " +
-        `Exports: ${Object.keys(phpModule || {}).join(", ")}`
-    );
-  }
-
-  debug.push("step:build-options");
-  let resolveReady: () => void = () => {};
-  const runtimeReady = new Promise<void>((res) => (resolveReady = res));
-
-  const moduleOptions = await buildModuleOptions();
-  moduleOptions.print = (txt: string) => {
-    try {
-      stdout.push(String(txt));
-    } catch {}
-  };
-  moduleOptions.printErr = (txt: string) => {
-    try {
-      stderr.push(String(txt));
-    } catch {}
-  };
-  moduleOptions.onRuntimeInitialized = () => {
-    try {
-      resolveReady();
-    } catch {}
-  };
-
-  debug.push("step:init-factory");
-  let php: any;
-  try {
-    php = await (initCandidate as any)(moduleOptions);
-  } catch (e1: any) {
-    try {
-      php = await (initCandidate as any)("WORKER", moduleOptions);
-      debug.push("factory:retry-with-WORKER:ok");
-    } catch (e2: any) {
-      throw new Error(
-        "PHP factory invocation failed.\n" +
-          "First error: " +
-          (e1?.stack || e1) +
-          "\n" +
-          "Retry error: " +
-          (e2?.stack || e2)
-      );
-    }
-  }
-
-  debug.push("step:await-ready");
-  const READY_TIMEOUT_MS = 8000;
-  const ready = await Promise.race([
-    runtimeReady.then(() => true),
-    new Promise<boolean>((res) => setTimeout(() => res(false), READY_TIMEOUT_MS)),
-  ]);
-  if (!ready) {
-    throw new Error(
-      "Emscripten runtime not initialized within timeout. " +
-        "Ensure the WASM build is single-threaded (no USE_PTHREADS/PROXY_TO_PTHREAD)."
-    );
-  }
-
-  return php;
-}
-
-async function runPhpInfo(): Promise<{ body: string; status: number; contentType: string }> {
+async function createPhpModuleAndRun(argv: string[]) {
   const debug: string[] = [];
   const stdout: string[] = [];
   const stderr: string[] = [];
+  let exitStatus: number | null = null;
 
   try {
-    const php = await createPhpModule(debug, stdout, stderr);
-
-    debug.push("step:detect-entry");
-    const hasCallMain = typeof (php as any).callMain === "function";
-    const hasRun = typeof (php as any).run === "function";
-
-    if (hasCallMain) {
-      debug.push("entry:callMain");
-      try {
-        (php as any).callMain(["-r", "phpinfo();"]);
-      } catch (e: any) {
-        stderr.push("[callMain] " + (e?.message || String(e)));
-      }
-    } else if (hasRun) {
-      debug.push("entry:run");
-      try {
-        (php as any).arguments = ["-r", "phpinfo();"];
-        (php as any).run();
-      } catch (e: any) {
-        stderr.push("[run] " + (e?.message || String(e)));
-      }
-    } else {
-      const summary = {
-        keys: Object.keys(php || {}),
-        has: {
-          callMain: hasCallMain,
-          run: hasRun,
-          ccall: typeof (php as any).ccall === "function",
-          cwrap: typeof (php as any).cwrap === "function",
-          _main: typeof (php as any)._main === "function",
-          FS: !!(php as any).FS,
-        },
-      };
+    debug.push("step:import-glue");
+    const phpModule = await import("../scripts/php_8_4.js");
+    const initCandidate =
+      (phpModule as any).init || (phpModule as any).default || (phpModule as any);
+    if (typeof initCandidate !== "function") {
       return {
-        body:
-          "No suitable entry to execute phpinfo(): neither callMain nor run exists.\n" +
-          JSON.stringify(summary, null, 2) +
-          "\nIf ccall/cwrap are present, we can add a wrapper to invoke _main with argv.",
-        status: 500,
-        contentType: "text/plain; charset=utf-8",
+        ok: false,
+        debug,
+        stdout,
+        stderr,
+        error:
+          "PHP init function not found on module export. " +
+          "Hint: ensure -s MODULARIZE=1 -s EXPORT_ES6=1. " +
+          `Exports: ${Object.keys(phpModule || {}).join(", ")}`,
       };
     }
 
-    const ok = stdout.length ? stdout.join("\n") : "";
-    const err = stderr.length ? stderr.join("\n") : "";
-    return {
-      body: (ok || err || "") + (debug.length ? `\n<!-- trace:${debug.join("->")} -->` : ""),
-      status: ok ? 200 : err ? 500 : 204,
-      contentType: ok ? "text/html; charset=utf-8" : "text/plain; charset=utf-8",
+    debug.push("step:build-options");
+    const moduleOptions: any = await buildModuleOptions(argv);
+    moduleOptions.print = (txt: string) => {
+      try {
+        stdout.push(String(txt));
+      } catch {}
     };
+    moduleOptions.printErr = (txt: string) => {
+      try {
+        stderr.push(String(txt));
+      } catch {}
+    };
+    moduleOptions.onRuntimeInitialized = () => {
+      // 仅用于 trace；minimal runtime 会在此后自动调用 main(argv)
+      debug.push("event:onRuntimeInitialized");
+    };
+
+    debug.push("step:init-factory");
+    let php: any;
+    try {
+      php = await (initCandidate as any)(moduleOptions);
+    } catch (e1: any) {
+      try {
+        php = await (initCandidate as any)("WORKER", moduleOptions);
+        debug.push("factory:retry-with-WORKER:ok");
+      } catch (e2: any) {
+        return {
+          ok: false,
+          debug,
+          stdout,
+          stderr,
+          error:
+            "PHP factory invocation failed.\n" +
+            "First error: " +
+            (e1?.stack || e1) +
+            "\n" +
+            "Retry error: " +
+            (e2?.stack || e2),
+        };
+      }
+    }
+
+    // 等待 runtime 初始化和 main 自动执行。为了稳妥，给一次短暂让步。
+    debug.push("step:await-output");
+    const WAIT_MS = 8000;
+    const start = Date.now();
+    while (Date.now() - start < WAIT_MS) {
+      // 若 glue 维护 calledRun 标志，尝试读取
+      if (typeof (php as any).calledRun !== "undefined") {
+        debug.push("probe:calledRun=" + String((php as any).calledRun));
+      }
+      // 若退出码已记录，提前结束等待
+      if (typeof moduleOptions.__exitStatus === "number") {
+        exitStatus = moduleOptions.__exitStatus;
+        break;
+      }
+      // 若已有明显输出，也可提前结束
+      if (stdout.length > 0) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+
+    if (typeof moduleOptions.__exitStatus === "number") {
+      exitStatus = moduleOptions.__exitStatus;
+      debug.push("exit:" + String(exitStatus));
+    }
+
+    return { ok: true, debug, stdout, stderr, php, exitStatus };
   } catch (e: any) {
     return {
-      body:
-        "Runtime error: " + (e?.stack || String(e)) + "\n" + "trace: " + debug.join(" -> "),
-      status: 500,
-      contentType: "text/plain; charset=utf-8",
+      ok: false,
+      debug: ["catch-top", e?.message || String(e)],
+      stdout,
+      stderr,
+      error: e?.stack || String(e),
     };
   }
+}
+
+async function runPhpInfo(): Promise<{ body: string; status: number; contentType: string }> {
+  const argv = ["-r", "phpinfo();"];
+  const res = await createPhpModuleAndRun(argv);
+
+  if (!res.ok) {
+    const body =
+      (res.stderr.length ? res.stderr.join("\n") + "\n" : "") +
+      (res.error || "Unknown error") +
+      "\ntrace: " +
+      (res.debug || []).join("->");
+    return { body, status: 500, contentType: "text/plain; charset=utf-8" };
+  }
+
+  const ok = res.stdout.length ? res.stdout.join("\n") : "";
+  const err = res.stderr.length ? res.stderr.join("\n") : "";
+  const trace = res.debug && res.debug.length ? `\n<!-- trace:${res.debug.join("->")} -->` : "";
+  const status = ok ? 200 : err ? 500 : typeof res.exitStatus === "number" ? (res.exitStatus === 0 ? 204 : 500) : 204;
+  return {
+    body: (ok || err || "") + trace,
+    status,
+    contentType: ok ? "text/html; charset=utf-8" : "text/plain; charset=utf-8",
+  };
 }
 
 export default {
@@ -280,33 +276,32 @@ export default {
     }
 
     if (pathname === "/__mod") {
-      const debug: string[] = [];
-      const stdout: string[] = [];
-      const stderr: string[] = [];
-      try {
-        const php = await createPhpModule(debug, stdout, stderr);
-        const summary = {
-          keys: Object.keys(php || {}),
-          has: {
-            callMain: typeof (php as any).callMain === "function",
-            run: typeof (php as any).run === "function",
-            ccall: typeof (php as any).ccall === "function",
-            cwrap: typeof (php as any).cwrap === "function",
-            _main: typeof (php as any)._main === "function",
-            FS: !!(php as any).FS,
-          },
-          trace: debug,
-        };
-        return new Response(JSON.stringify(summary, null, 2), {
-          status: 200,
-          headers: { "content-type": "application/json; charset=utf-8" },
-        });
-      } catch (e: any) {
-        return textResponse(
-          "init error: " + (e?.stack || String(e)) + "\ntrace: " + debug.join("->"),
-          500
-        );
-      }
+      const argv = ["-r", "phpinfo();"];
+      const res = await createPhpModuleAndRun(argv);
+      const summary =
+        res.ok
+          ? {
+              keys: res.php ? Object.keys(res.php) : [],
+              has: {
+                callMain: typeof (res.php as any)?.callMain === "function",
+                run: typeof (res.php as any)?.run === "function",
+                ccall: typeof (res.php as any)?.ccall === "function",
+                cwrap: typeof (res.php as any)?.cwrap === "function",
+                _main: typeof (res.php as any)?._main === "function",
+                FS: !!(res.php as any)?.FS,
+              },
+              calledRun: (res.php as any)?.calledRun ?? undefined,
+              exitStatus: res.exitStatus ?? undefined,
+              trace: res.debug,
+              stdoutSample: (res.stdout || []).slice(0, 2),
+              stderrSample: (res.stderr || []).slice(0, 2),
+            }
+          : { error: res.error, trace: res.debug, stderr: res.stderr.slice(0, 5) };
+
+      return new Response(JSON.stringify(summary, null, 2), {
+        status: 200,
+        headers: { "content-type": "application/json; charset=utf-8" },
+      });
     }
 
     if (pathname === "/" || pathname === "/index.php") {
