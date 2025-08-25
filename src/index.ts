@@ -56,6 +56,12 @@ function textResponse(body: string, status = 200, headers: Record<string, string
   });
 }
 
+// 1) 顶部新增（建议放在其它函数之前）
+const DEFAULT_INIS = [
+  "pcre.jit=0",
+  "opcache.enable_cli=0",
+  "opcache.jit=0",
+];
 type RunResult = {
   ok: boolean;
   stdout: string[];
@@ -66,11 +72,14 @@ type RunResult = {
   error?: string;
 };
 
+// 2) 修改 buildModuleOptions，把默认 -d 注入到 argv 前面
 async function buildModuleOptions(argv: string[]) {
+  const dArgs: string[] = [];
+  for (const d of DEFAULT_INIS) dArgs.push("-d", d);
   // 注意：noInitialRun=false 让 Emscripten 在初始化完成后自动执行 main(argv)
   const opts: any = {
     noInitialRun: false,
-    arguments: argv.slice(),
+    arguments: [...dArgs, ...argv],  // 这里把默认 INI 注入
     print: () => {},
     printErr: () => {},
     onRuntimeInitialized: () => {},
