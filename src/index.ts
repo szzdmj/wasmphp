@@ -1,7 +1,10 @@
-// V33 执行版（Minimal Runtime + 路由扩展）
-// - 构建形态：不导出 callMain/run，仅有 _main（minimal runtime）
-// - 方案：noInitialRun=false + arguments，让初始化后自动执行 main(argv)
-// - 新增：/run (GET/POST 执行代码)、/version、/help，保留 /info(/ /index.php)、诊断路由
+// V34 执行版（默认禁用 JIT + 支持从仓库执行 public/index.php）
+// 关键点：
+// - 默认注入 -d pcre.jit=0, opcache.enable_cli=0, opcache.jit=0，避免 munmap() 退出错误
+// - 新增路由 /public/index.php：从 GitHub Raw 拉取 PHP 源，去掉 <?php，用 -r 执行
+// - 其它：/info(/ /)、/run、/version、/help、/__probe、/__jsplus、/__mod 仍保留
+//
+// 构建形态：Emscripten minimal runtime（不导出 callMain/run），使用 noInitialRun=false + arguments 自动执行 main(argv)
 
 import wasmAsset from "../scripts/php_8_4.wasm";
 
@@ -9,30 +12,21 @@ import wasmAsset from "../scripts/php_8_4.wasm";
 (function ensureGlobals() {
   const g = globalThis as any;
   if (typeof g.location === "undefined" || typeof g.location?.href === "undefined") {
-    try {
-      Object.defineProperty(g, "location", {
-        value: { href: "file:///" },
-        configurable: true,
-        enumerable: false,
-        writable: false,
-      });
-    } catch {}
+    try { Object.defineProperty(g, "location", { value: { href: "file:///" }, configurable: true }); } catch {}
   }
   if (typeof g.self === "undefined") {
-    try {
-      Object.defineProperty(g, "self", {
-        value: g,
-        configurable: true,
-        enumerable: false,
-        writable: false,
-      });
-    } catch {}
+    try { Object.defineProperty(g, "self", { value: g, configurable: true }); } catch {}
   } else if (typeof g.self.location === "undefined" && typeof g.location !== "undefined") {
-    try {
-      g.self.location = g.location;
-    } catch {}
+    try { g.self.location = g.location; } catch {}
   }
 })();
+
+// 默认 INI（禁用 JIT，避免 munmap）
+const DEFAULT_INIS = [
+  "pcre.jit=0",
+  "opcache.enable_cli=0",
+  "opcache.jit=0",
+];
 
 function isWasmModule(x: any): x is WebAssembly.Module {
   return Object.prototype.toString.call(x) === "[object WebAssembly.Module]";
@@ -42,26 +36,15 @@ function makeInstantiateWithModule(wasmModule: WebAssembly.Module) {
   // 兼容 Emscripten：既返回 exports，也调用 successCallback
   return (imports: WebAssembly.Imports, successCallback: (i: WebAssembly.Instance) => void) => {
     const instance = new WebAssembly.Instance(wasmModule, imports);
-    try {
-      successCallback(instance);
-    } catch {}
+    try { successCallback(instance); } catch {}
     return instance.exports as any;
   };
 }
 
 function textResponse(body: string, status = 200, headers: Record<string, string> = {}) {
-  return new Response(body, {
-    status,
-    headers: { "content-type": "text/plain; charset=utf-8", ...headers },
-  });
+  return new Response(body, { status, headers: { "content-type": "text/plain; charset=utf-8", ...headers } });
 }
 
-// 1) 顶部新增（建议放在其它函数之前）
-const DEFAULT_INIS = [
-  "pcre.jit=0",
-  "opcache.enable_cli=0",
-  "opcache.jit=0",
-];
 type RunResult = {
   ok: boolean;
   stdout: string[];
@@ -72,18 +55,25 @@ type RunResult = {
   error?: string;
 };
 
-// 2) 修改 buildModuleOptions，把默认 -d 注入到 argv 前面
+function buildArgvForCode(code: string, iniList: string[] = []): string[] {
+  const argv: string[] = [];
+  // 默认注入 -d
+  for (const d of DEFAULT_INIS) argv.push("-d", d);
+  // 追加调用者传入的 -d
+  for (const d of iniList) if (d) argv.push("-d", d);
+  // 使用 -r 执行
+  argv.push("-r", code);
+  return argv;
+}
+
 async function buildModuleOptions(argv: string[]) {
-  const dArgs: string[] = [];
-  for (const d of DEFAULT_INIS) dArgs.push("-d", d);
-  // 注意：noInitialRun=false 让 Emscripten 在初始化完成后自动执行 main(argv)
+  // minimal runtime：初始化后自动执行 main(argv)
   const opts: any = {
     noInitialRun: false,
-    arguments: [...dArgs, ...argv],  // 这里把默认 INI 注入
+    arguments: argv.slice(),
     print: () => {},
     printErr: () => {},
     onRuntimeInitialized: () => {},
-    // 捕获退出码，防止直接抛异常导致 1101
     quit: (status: number, toThrow?: any) => {
       (opts as any).__exitStatus = status;
       (opts as any).__exitThrown = toThrow ? String(toThrow) : "";
@@ -126,36 +116,18 @@ async function createPhpModuleAndRun(argv: string[], waitMs = 8000): Promise<Run
   try {
     debug.push("step:import-glue");
     const phpModule = await import("../scripts/php_8_4.js");
-    const initCandidate =
-      (phpModule as any).init || (phpModule as any).default || (phpModule as any);
+    const initCandidate = (phpModule as any).init || (phpModule as any).default || (phpModule as any);
     if (typeof initCandidate !== "function") {
-      return {
-        ok: false,
-        stdout,
-        stderr,
-        debug,
-        error:
-          "PHP init function not found on module export. " +
-          "Hint: ensure -s MODULARIZE=1 -s EXPORT_ES6=1. " +
-          `Exports: ${Object.keys(phpModule || {}).join(", ")}`,
+      return { ok: false, stdout, stderr, debug,
+        error: "PHP init function not found on module export. Ensure -s MODULARIZE=1 -s EXPORT_ES6=1. Exports: " + Object.keys(phpModule || {}).join(", "),
       };
     }
 
     debug.push("step:build-options");
     const moduleOptions: any = await buildModuleOptions(argv);
-    moduleOptions.print = (txt: string) => {
-      try {
-        stdout.push(String(txt));
-      } catch {}
-    };
-    moduleOptions.printErr = (txt: string) => {
-      try {
-        stderr.push(String(txt));
-      } catch {}
-    };
-    moduleOptions.onRuntimeInitialized = () => {
-      debug.push("event:onRuntimeInitialized");
-    };
+    moduleOptions.print = (txt: string) => { try { stdout.push(String(txt)); } catch {} };
+    moduleOptions.printErr = (txt: string) => { try { stderr.push(String(txt)); } catch {} };
+    moduleOptions.onRuntimeInitialized = () => { debug.push("event:onRuntimeInitialized"); };
 
     debug.push("step:init-factory");
     let php: any;
@@ -166,23 +138,12 @@ async function createPhpModuleAndRun(argv: string[], waitMs = 8000): Promise<Run
         php = await (initCandidate as any)("WORKER", moduleOptions);
         debug.push("factory:retry-with-WORKER:ok");
       } catch (e2: any) {
-        return {
-          ok: false,
-          stdout,
-          stderr,
-          debug,
-          error:
-            "PHP factory invocation failed.\n" +
-            "First error: " +
-            (e1?.stack || e1) +
-            "\n" +
-            "Retry error: " +
-            (e2?.stack || e2),
+        return { ok: false, stdout, stderr, debug,
+          error: "PHP factory invocation failed.\nFirst error: " + (e1?.stack || e1) + "\nRetry error: " + (e2?.stack || e2),
         };
       }
     }
 
-    // 等待 runtime 初始化和 main 自动执行
     debug.push("step:await-output");
     const start = Date.now();
     while (Date.now() - start < waitMs) {
@@ -194,37 +155,17 @@ async function createPhpModuleAndRun(argv: string[], waitMs = 8000): Promise<Run
         debug.push("exit:" + String(exitStatus));
         break;
       }
-      // 若有明显输出也可提前结束
       if (stdout.length > 0) break;
       await new Promise((r) => setTimeout(r, 50));
     }
 
     return { ok: true, stdout, stderr, debug, php, exitStatus };
   } catch (e: any) {
-    return {
-      ok: false,
-      stdout,
-      stderr,
-      debug: ["catch-top", e?.message || String(e)],
-      error: e?.stack || String(e),
-    };
+    return { ok: false, stdout, stderr, debug: ["catch-top", e?.message || String(e)], error: e?.stack || String(e) };
   }
-}
-
-function buildArgvForCode(code: string, iniList: string[] = []): string[] {
-  const argv: string[] = [];
-  // 注入 -d 选项
-  for (const d of iniList) {
-    if (!d) continue;
-    argv.push("-d", d);
-  }
-  // 使用 -r 执行代码
-  argv.push("-r", code);
-  return argv;
 }
 
 function parseIniParams(url: URL): string[] {
-  // 支持 ?d=key=value 可重复；兼容 ?ini=key=value
   const out: string[] = [];
   const ds = url.searchParams.getAll("d").concat(url.searchParams.getAll("ini"));
   for (const s of ds) {
@@ -235,22 +176,15 @@ function parseIniParams(url: URL): string[] {
 }
 
 function inferContentTypeFromOutput(stdout: string, fallback = "text/plain; charset=utf-8") {
-  // phpinfo() 输出为 HTML；其他默认纯文本
-  if (stdout.includes("<html") || stdout.includes("<!DOCTYPE html")) {
-    return "text/html; charset=utf-8";
-  }
+  if (stdout.includes("<html") || stdout.includes("<!DOCTYPE html")) return "text/html; charset=utf-8";
   return fallback;
 }
 
 async function routeInfo(): Promise<Response> {
-  const argv = ["-r", "phpinfo();"];
+  const argv = buildArgvForCode("phpinfo();");
   const res = await createPhpModuleAndRun(argv);
   if (!res.ok) {
-    const body =
-      (res.stderr.length ? res.stderr.join("\n") + "\n" : "") +
-      (res.error || "Unknown error") +
-      "\ntrace: " +
-      (res.debug || []).join("->");
+    const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
     return textResponse(body, 500);
   }
   const stdout = res.stdout.join("\n");
@@ -258,25 +192,19 @@ async function routeInfo(): Promise<Response> {
   const ct = inferContentTypeFromOutput(stdout, "text/html; charset=utf-8");
   const trace = res.debug.length ? `\n<!-- trace:${res.debug.join("->")} -->` : "";
   const body = (stdout || err || "") + trace;
-  const status =
-    stdout ? 200 : err ? 500 : typeof res.exitStatus === "number" ? (res.exitStatus === 0 ? 204 : 500) : 204;
+  const status = stdout ? 200 : err ? 500 : typeof res.exitStatus === "number" ? (res.exitStatus === 0 ? 204 : 500) : 204;
   return new Response(body, { status, headers: { "content-type": ct } });
 }
 
 async function routeRunGET(url: URL): Promise<Response> {
   const codeRaw = url.searchParams.get("code") ?? "";
-  const code = codeRaw;
-  if (!code) return textResponse("Bad Request: missing code", 400);
-  if (code.length > 64 * 1024) return textResponse("Payload Too Large", 413);
+  if (!codeRaw) return textResponse("Bad Request: missing code", 400);
+  if (codeRaw.length > 64 * 1024) return textResponse("Payload Too Large", 413);
   const ini = parseIniParams(url);
-  const argv = buildArgvForCode(code, ini);
+  const argv = buildArgvForCode(codeRaw, ini);
   const res = await createPhpModuleAndRun(argv);
   if (!res.ok) {
-    const body =
-      (res.stderr.length ? res.stderr.join("\n") + "\n" : "") +
-      (res.error || "Unknown error") +
-      "\ntrace: " +
-      (res.debug || []).join("->");
+    const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
     return textResponse(body, 500);
   }
   const stdout = res.stdout.join("\n");
@@ -284,8 +212,7 @@ async function routeRunGET(url: URL): Promise<Response> {
   const ct = inferContentTypeFromOutput(stdout);
   const trace = res.debug.length ? `\n<!-- trace:${res.debug.join("->")} -->` : "";
   const body = (stdout || err || "") + trace;
-  const status =
-    stdout ? 200 : err ? 500 : typeof res.exitStatus === "number" ? (res.exitStatus === 0 ? 204 : 500) : 204;
+  const status = stdout ? 200 : err ? 500 : typeof res.exitStatus === "number" ? (res.exitStatus === 0 ? 204 : 500) : 204;
   return new Response(body, { status, headers: { "content-type": ct } });
 }
 
@@ -297,11 +224,7 @@ async function routeRunPOST(request: Request, url: URL): Promise<Response> {
   const argv = buildArgvForCode(code, ini);
   const res = await createPhpModuleAndRun(argv, 10000);
   if (!res.ok) {
-    const body =
-      (res.stderr.length ? res.stderr.join("\n") + "\n" : "") +
-      (res.error || "Unknown error") +
-      "\ntrace: " +
-      (res.debug || []).join("->");
+    const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
     return textResponse(body, 500);
   }
   const stdout = res.stdout.join("\n");
@@ -309,19 +232,78 @@ async function routeRunPOST(request: Request, url: URL): Promise<Response> {
   const ct = inferContentTypeFromOutput(stdout);
   const trace = res.debug.length ? `\n<!-- trace:${res.debug.join("->")} -->` : "";
   const body = (stdout || err || "") + trace;
-  const status =
-    stdout ? 200 : err ? 500 : typeof res.exitStatus === "number" ? (res.exitStatus === 0 ? 204 : 500) : 204;
+  const status = stdout ? 200 : err ? 500 : typeof res.exitStatus === "number" ? (res.exitStatus === 0 ? 204 : 500) : 204;
+  return new Response(body, { status, headers: { "content-type": ct } });
+}
+
+// ——— 从 GitHub Raw 读取 PHP 源并执行 ———
+function normalizePhpCodeForEval(src: string): string {
+  let s = src.trimStart();
+  if (s.startsWith("<?php")) s = s.slice(5);
+  else if (s.startsWith("<?")) s = s.slice(2);
+  // 去掉可能的结尾 ?>（非必须）
+  s = s.replace(/\?>\s*$/s, "");
+  return s;
+}
+
+async function fetchGithubPhpSource(owner: string, repo: string, path: string, ref?: string): Promise<{ ok: boolean; code?: string; err?: string }> {
+  const branch = (ref && ref.trim()) || "main";
+  const url = `https://raw.githubusercontent.com/${owner}/${repo}/${encodeURIComponent(branch)}/${path.replace(/^\/+/, "")}`;
+  // 避免缓存：no-store，并通过 cf 关闭边缘缓存
+  const res = await fetch(url, {
+    method: "GET",
+    headers: { "cache-control": "no-cache" },
+    cf: { cacheTtl: 0, cacheEverything: false } as any,
+  });
+  if (res.ok) {
+    const txt = await res.text();
+    return { ok: true, code: normalizePhpCodeForEval(txt) };
+  }
+  // 尝试 master 回退
+  if (branch !== "master") {
+    const url2 = `https://raw.githubusercontent.com/${owner}/${repo}/master/${path.replace(/^\/+/, "")}`;
+    const res2 = await fetch(url2, { headers: { "cache-control": "no-cache" }, cf: { cacheTtl: 0, cacheEverything: false } as any });
+    if (res2.ok) {
+      const txt2 = await res2.text();
+      return { ok: true, code: normalizePhpCodeForEval(txt2) };
+    }
+  }
+  return { ok: false, err: `Failed to fetch ${owner}/${repo}:${branch}/${path} (${res.status})` };
+}
+
+async function routeRepoIndex(url: URL): Promise<Response> {
+  const ref = url.searchParams.get("ref") || undefined; // 支持 ?ref= 分支或提交
+  const pull = await fetchGithubPhpSource("szzdmj", "wasmphp", "public/index.php", ref);
+  if (!pull.ok) return textResponse(pull.err || "Fetch error", 502);
+  const argv = buildArgvForCode(pull.code!);
+  const res = await createPhpModuleAndRun(argv, 10000);
+  if (!res.ok) {
+    const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
+    return textResponse(body, 500);
+  }
+  const stdout = res.stdout.join("\n");
+  const err = res.stderr.join("\n");
+  const ct = inferContentTypeFromOutput(stdout, "text/html; charset=utf-8");
+  const trace = res.debug.length ? `\n<!-- trace:${res.debug.join("->")} -->` : "";
+  const body = (stdout || err || "") + trace;
+  const status = stdout ? 200 : err ? 500 : typeof res.exitStatus === "number" ? (res.exitStatus === 0 ? 204 : 500) : 204;
   return new Response(body, { status, headers: { "content-type": ct } });
 }
 
 async function routeVersion(): Promise<Response> {
-  const res = await createPhpModuleAndRun(["-v"]);
+  const argv: string[] = [];
+  for (const d of DEFAULT_INIS) { argv.push("-d", d); }
+  argv.push("-v");
+  const res = await createPhpModuleAndRun(argv);
   const body = (res.stdout.join("\n") || res.stderr.join("\n") || "") + (res.debug.length ? `\ntrace:${res.debug.join("->")}` : "");
   return textResponse(body || "", res.ok ? 200 : 500);
 }
 
 async function routeHelp(): Promise<Response> {
-  const res = await createPhpModuleAndRun(["-h"]);
+  const argv: string[] = [];
+  for (const d of DEFAULT_INIS) { argv.push("-d", d); }
+  argv.push("-h");
+  const res = await createPhpModuleAndRun(argv);
   const body = (res.stdout.join("\n") || res.stderr.join("\n") || "") + (res.debug.length ? `\ntrace:${res.debug.join("->")}` : "");
   return textResponse(body || "", res.ok ? 200 : 500);
 }
@@ -336,11 +318,7 @@ export default {
     // 诊断：环境
     if (pathname === "/__probe") {
       let importMetaUrl: string | null = null;
-      try {
-        importMetaUrl = (import.meta as any)?.url ?? null;
-      } catch {
-        importMetaUrl = null;
-      }
+      try { importMetaUrl = (import.meta as any)?.url ?? null; } catch { importMetaUrl = null; }
       const body = {
         env: {
           esm: true,
@@ -350,10 +328,7 @@ export default {
         },
         importMeta: { available: typeof import.meta !== "undefined", url: importMetaUrl },
       };
-      return new Response(JSON.stringify(body, null, 2), {
-        status: 200,
-        headers: { "content-type": "application/json; charset=utf-8" },
-      });
+      return new Response(JSON.stringify(body, null, 2), { status: 200, headers: { "content-type": "application/json; charset=utf-8" } });
     }
 
     // 诊断：仅导入 glue
@@ -362,16 +337,8 @@ export default {
         const mod = await import("../scripts/php_8_4.js");
         const def = (mod as any)?.default ?? null;
         const hasFactory = typeof def === "function";
-        const payload = {
-          imported: true,
-          hasDefaultFactory: hasFactory,
-          exportKeys: Object.keys(mod || {}),
-          note: "仅探测模块导出形态，不触发初始化。",
-        };
-        return new Response(JSON.stringify(payload, null, 2), {
-          status: 200,
-          headers: { "content-type": "application/json; charset=utf-8" },
-        });
+        const payload = { imported: true, hasDefaultFactory: hasFactory, exportKeys: Object.keys(mod || {}), note: "仅探测模块导出形态，不触发初始化。" };
+        return new Response(JSON.stringify(payload, null, 2), { status: 200, headers: { "content-type": "application/json; charset=utf-8" } });
       } catch (e: any) {
         return textResponse("Import glue failed:\n" + (e?.stack || String(e)), 500);
       }
@@ -379,36 +346,37 @@ export default {
 
     // 诊断：模块导出形态（初始化后）
     if (pathname === "/__mod") {
-      const res = await createPhpModuleAndRun(["-r", "echo 'ok';"]);
-      const summary =
-        res.ok
-          ? {
-              keys: res.php ? Object.keys(res.php) : [],
-              has: {
-                callMain: typeof (res.php as any)?.callMain === "function",
-                run: typeof (res.php as any)?.run === "function",
-                ccall: typeof (res.php as any)?.ccall === "function",
-                cwrap: typeof (res.php as any)?.cwrap === "function",
-                _main: typeof (res.php as any)?._main === "function",
-                FS: !!(res.php as any)?.FS,
-              },
-              calledRun: (res.php as any)?.calledRun ?? undefined,
-              exitStatus: res.exitStatus ?? undefined,
-              trace: res.debug,
-              stdoutSample: (res.stdout || []).slice(0, 2),
-              stderrSample: (res.stderr || []).slice(0, 2),
-            }
-          : { error: res.error, trace: res.debug, stderr: res.stderr.slice(0, 5) };
-
-      return new Response(JSON.stringify(summary, null, 2), {
-        status: 200,
-        headers: { "content-type": "application/json; charset=utf-8" },
-      });
+      const argv = buildArgvForCode("echo 'ok';");
+      const res = await createPhpModuleAndRun(argv);
+      const summary = res.ok
+        ? {
+            keys: res.php ? Object.keys(res.php) : [],
+            has: {
+              callMain: typeof (res.php as any)?.callMain === "function",
+              run: typeof (res.php as any)?.run === "function",
+              ccall: typeof (res.php as any)?.ccall === "function",
+              cwrap: typeof (res.php as any)?.cwrap === "function",
+              _main: typeof (res.php as any)?._main === "function",
+              FS: !!(res.php as any)?.FS,
+            },
+            calledRun: (res.php as any)?.calledRun ?? undefined,
+            exitStatus: res.exitStatus ?? undefined,
+            trace: res.debug,
+            stdoutSample: (res.stdout || []).slice(0, 2),
+            stderrSample: (res.stderr || []).slice(0, 2),
+          }
+        : { error: res.error, trace: res.debug, stderr: res.stderr.slice(0, 5) };
+      return new Response(JSON.stringify(summary, null, 2), { status: 200, headers: { "content-type": "application/json; charset=utf-8" } });
     }
 
     // 信息页：phpinfo
     if (pathname === "/" || pathname === "/index.php" || pathname === "/info") {
       return routeInfo();
+    }
+
+    // 从 GitHub 仓库执行 public/index.php
+    if (pathname === "/public/index.php") {
+      return routeRepoIndex(url);
     }
 
     // 执行：GET 代码
