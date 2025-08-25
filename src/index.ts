@@ -1,4 +1,4 @@
-// V66e: Execute /public/index.php via eval(base64_decode(...)) to avoid -r multiline/encoding pitfalls.
+// V66f: Execute /public/index.php by writing to MEMFS and running "php -f /tmp/public_index.php".
 // Keep: hardened against 1101, stderr noise filtering, default JIT disabled, __net, /public raw, full try/catch.
 
 import wasmAsset from "../scripts/php_8_4.wasm";
@@ -74,7 +74,15 @@ function buildArgvForCode(code: string, iniList: string[] = []): string[] {
   return argv;
 }
 
-async function buildModuleOptions(argv: string[]) {
+function buildArgvForFile(path: string, iniList: string[] = []): string[] {
+  const argv: string[] = [];
+  for (const d of DEFAULT_INIS) argv.push("-d", d);
+  for (const d of iniList) if (d) argv.push("-d", d);
+  argv.push("-f", path);
+  return argv;
+}
+
+async function buildModuleOptions(argv: string[], preRun?: (mod: any) => void) {
   const opts: any = {
     noInitialRun: false,
     arguments: argv.slice(),
@@ -86,6 +94,11 @@ async function buildModuleOptions(argv: string[]) {
       (opts as any).__exitThrown = toThrow ? String(toThrow) : "";
     },
   };
+
+  if (preRun) {
+    // Emscripten will call functions in preRun before main()
+    opts.preRun = [preRun];
+  }
 
   if (isWasmModule(wasmAsset)) {
     opts.instantiateWasm = makeInstantiateWithModule(wasmAsset as WebAssembly.Module);
@@ -114,7 +127,7 @@ async function buildModuleOptions(argv: string[]) {
   throw new Error("Unsupported wasm asset type at runtime");
 }
 
-async function createPhpModuleAndRun(argv: string[], waitMs = 8000): Promise<RunResult> {
+async function createPhpModuleAndRun(argv: string[], waitMs = 8000, preRun?: (mod: any) => void): Promise<RunResult> {
   const debug: string[] = [];
   const stdout: string[] = [];
   const stderr: string[] = [];
@@ -131,7 +144,7 @@ async function createPhpModuleAndRun(argv: string[], waitMs = 8000): Promise<Run
     }
 
     debug.push("step:build-options");
-    const moduleOptions: any = await buildModuleOptions(argv);
+    const moduleOptions: any = await buildModuleOptions(argv, preRun);
     moduleOptions.print = (txt: string) => { try { stdout.push(String(txt)); } catch {} };
     moduleOptions.printErr = (txt: string) => { try { stderr.push(String(txt)); } catch {} };
     moduleOptions.onRuntimeInitialized = () => { debug.push("event:onRuntimeInitialized"); };
@@ -236,18 +249,6 @@ function normalizePhpCodeForEval(src: string): string {
   return s;
 }
 
-// base64 (UTF-8) helper safe for large inputs
-function toBase64Utf8(s: string): string {
-  const bytes = new TextEncoder().encode(s);
-  let binary = "";
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
-  }
-  // btoa is available in Workers
-  return btoa(binary);
-}
-
 async function fetchGithubPhpSource(owner: string, repo: string, path: string, ref?: string): Promise<{ ok: boolean; code?: string; err?: string; status?: number }> {
   try {
     const branch = (ref && ref.trim()) || "main";
@@ -338,14 +339,24 @@ async function routeRepoIndex(url: URL): Promise<Response> {
       return new Response(pull.code || "", { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
     }
 
-    // Execute via base64-eval to avoid -r multiline/encoding issues
-    const codeNormalized = pull.code!;
-    const b64 = toBase64Utf8(codeNormalized);
-    const oneLiner = `eval(base64_decode('${b64}'));`;
-
+    const codeNormalized = pull.code || "";
+    const filePath = "/tmp/public_index.php";
     const ini = parseIniParams(url);
-    const argv = buildArgvForCode(oneLiner, ini);
-    const res = await createPhpModuleAndRun(argv, 10000);
+    const argv = buildArgvForFile(filePath, ini);
+
+    const preRun = (mod: any) => {
+      try {
+        const FS = mod.FS || (mod.Module && mod.Module.FS);
+        if (!FS) return;
+        try { FS.mkdir("/tmp"); } catch {}
+        const bytes = new TextEncoder().encode(codeNormalized);
+        FS.writeFile(filePath, bytes);
+      } catch (e) {
+        // Swallow; execution will fail and be reported in stderr/stdout
+      }
+    };
+
+    const res = await createPhpModuleAndRun(argv, 10000, preRun);
     if (!res.ok) {
       const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
       return textResponse(body, 500);
