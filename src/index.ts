@@ -1,14 +1,8 @@
-// V36 执行版（过滤无害 stderr 噪声 + 调试开关）
-// - 继续默认禁用 JIT/映射（pcre/opcache），并关闭输出缓冲
-// - 默认过滤 stderr 中的 “munmap() failed: [28] Invalid argument” 噪声
-// - ?debug=1 或 ?showstderr=1 时不过滤，完整输出 stderr
-// - stdout 一旦有内容，HTTP 状态码固定 200，避免被无害 stderr 影响
-//
-// 构建形态：Emscripten minimal runtime（无 callMain/run），使用 noInitialRun=false + arguments
+// V66a: Hardened against 1101, safer GitHub fetch, raw view for /public, and full try/catch guards.
 
 import wasmAsset from "../scripts/php_8_4.wasm";
 
-// 轻量 polyfill
+// Minimal globals to satisfy Emscripten glue in Workers
 (function ensureGlobals() {
   const g = globalThis as any;
   if (typeof g.location === "undefined" || typeof g.location?.href === "undefined") {
@@ -21,7 +15,6 @@ import wasmAsset from "../scripts/php_8_4.wasm";
   }
 })();
 
-// 默认 INI（禁用 JIT/缓存 + 让输出立即可见）
 const DEFAULT_INIS = [
   "pcre.jit=0",
   "opcache.enable=0",
@@ -178,12 +171,9 @@ async function createPhpModuleAndRun(argv: string[], waitMs = 8000): Promise<Run
   }
 }
 
-// 过滤已知无害的 stderr 噪声（默认开启，?debug=1 时关闭）
 function filterKnownNoise(lines: string[], keepAll: boolean) {
   if (keepAll) return { kept: lines.slice(), ignored: 0 };
-  const patterns: RegExp[] = [
-    /^munmap\(\)\s+failed:\s+\[\d+\]\s+Invalid argument/i,
-  ];
+  const patterns: RegExp[] = [/^munmap\(\)\s+failed:\s+\[\d+\]\s+Invalid argument/i];
   let ignored = 0;
   const kept = lines.filter((l) => {
     const t = String(l || "").trim();
@@ -201,72 +191,7 @@ function inferContentTypeFromOutput(stdout: string, fallback = "text/plain; char
   return fallback;
 }
 
-async function routeInfo(url: URL): Promise<Response> {
-  const argv = buildArgvForCode("phpinfo();");
-  const res = await createPhpModuleAndRun(argv);
-  const debugMode = url.searchParams.get("debug") === "1" || url.searchParams.get("showstderr") === "1";
-
-  if (!res.ok) {
-    const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
-    return textResponse(body, 500);
-  }
-  const stdout = res.stdout.join("\n");
-  const { kept: errKept } = filterKnownNoise(res.stderr, debugMode);
-  const err = errKept.join("\n");
-  const ct = inferContentTypeFromOutput(stdout, "text/html; charset=utf-8");
-  const trace = res.debug.length ? `\n<!-- trace:${res.debug.join("->")} -->` : "";
-  const body = (stdout || err || "") + trace;
-  const status = stdout ? 200 : err ? 500 : typeof res.exitStatus === "number" ? (res.exitStatus === 0 ? 204 : 500) : 204;
-  return new Response(body, { status, headers: { "content-type": ct } });
-}
-
-async function routeRunGET(url: URL): Promise<Response> {
-  const codeRaw = url.searchParams.get("code") ?? "";
-  if (!codeRaw) return textResponse("Bad Request: missing code", 400);
-  if (codeRaw.length > 64 * 1024) return textResponse("Payload Too Large", 413);
-  const ini = parseIniParams(url);
-  const argv = buildArgvForCode(codeRaw, ini);
-  const res = await createPhpModuleAndRun(argv);
-  const debugMode = url.searchParams.get("debug") === "1" || url.searchParams.get("showstderr") === "1";
-
-  if (!res.ok) {
-    const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
-    return textResponse(body, 500);
-  }
-  const stdout = res.stdout.join("\n");
-  const { kept: errKept } = filterKnownNoise(res.stderr, debugMode);
-  const err = errKept.join("\n");
-  const ct = inferContentTypeFromOutput(stdout);
-  const trace = res.debug.length ? `\n<!-- trace:${res.debug.join("->")} -->` : "";
-  const body = (stdout || err || "") + trace;
-  const status = stdout ? 200 : err ? 500 : typeof res.exitStatus === "number" ? (res.exitStatus === 0 ? 204 : 500) : 204;
-  return new Response(body, { status, headers: { "content-type": ct } });
-}
-
-async function routeRunPOST(request: Request, url: URL): Promise<Response> {
-  const code = await request.text();
-  if (!code) return textResponse("Bad Request: empty body", 400);
-  if (code.length > 256 * 1024) return textResponse("Payload Too Large", 413);
-  const ini = parseIniParams(url);
-  const argv = buildArgvForCode(code, ini);
-  const res = await createPhpModuleAndRun(argv, 10000);
-  const debugMode = url.searchParams.get("debug") === "1" || url.searchParams.get("showstderr") === "1";
-
-  if (!res.ok) {
-    const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
-    return textResponse(body, 500);
-  }
-  const stdout = res.stdout.join("\n");
-  const { kept: errKept } = filterKnownNoise(res.stderr, debugMode);
-  const err = errKept.join("\n");
-  const ct = inferContentTypeFromOutput(stdout);
-  const trace = res.debug.length ? `\n<!-- trace:${res.debug.join("->")} -->` : "";
-  const body = (stdout || err || "") + trace;
-  const status = stdout ? 200 : err ? 500 : typeof res.exitStatus === "number" ? (res.exitStatus === 0 ? 204 : 500) : 204;
-  return new Response(body, { status, headers: { "content-type": ct } });
-}
-
-// ——— 从 GitHub Raw 读取 PHP 源并执行 ———
+// ——— GitHub Raw helpers ———
 function normalizePhpCodeForEval(src: string): string {
   let s = src.trimStart();
   if (s.startsWith("<?php")) s = s.slice(5);
@@ -275,146 +200,58 @@ function normalizePhpCodeForEval(src: string): string {
   return s;
 }
 
-async function fetchGithubPhpSource(owner: string, repo: string, path: string, ref?: string): Promise<{ ok: boolean; code?: string; err?: string }> {
-  const branch = (ref && ref.trim()) || "main";
-  const url = `https://raw.githubusercontent.com/${owner}/${repo}/${encodeURIComponent(branch)}/${path.replace(/^\/+/, "")}`;
-  const res = await fetch(url, {
-    method: "GET",
-    headers: { "cache-control": "no-cache" },
-    cf: { cacheTtl: 0, cacheEverything: false } as any,
-  });
-  if (res.ok) {
-    const txt = await res.text();
-    return { ok: true, code: normalizePhpCodeForEval(txt) };
-  }
-  if (branch !== "master") {
-    const url2 = `https://raw.githubusercontent.com/${owner}/${repo}/master/${path.replace(/^\/+/, "")}`;
-    const res2 = await fetch(url2, { headers: { "cache-control": "no-cache" }, cf: { cacheTtl: 0, cacheEverything: false } as any });
-    if (res2.ok) {
-      const txt2 = await res2.text();
-      return { ok: true, code: normalizePhpCodeForEval(txt2) };
+async function fetchGithubPhpSource(owner: string, repo: string, path: string, ref?: string): Promise<{ ok: boolean; code?: string; err?: string; status?: number }> {
+  try {
+    const branch = (ref && ref.trim()) || "main";
+    const u = `https://raw.githubusercontent.com/${owner}/${repo}/${encodeURIComponent(branch)}/${path.replace(/^\/+/, "")}`;
+    const headers: Record<string, string> = {
+      "cache-control": "no-cache",
+      "user-agent": "wasmphp-worker",
+      "accept": "text/plain, */*",
+    };
+    let res = await fetch(u, { method: "GET", headers });
+    if (res.ok) {
+      const txt = await res.text();
+      return { ok: true, code: normalizePhpCodeForEval(txt), status: res.status };
     }
-  }
-  return { ok: false, err: `Failed to fetch ${owner}/${repo}:${branch}/${path} (${res.status})` };
-}
-
-async function routeRepoIndex(url: URL): Promise<Response> {
-  const ref = url.searchParams.get("ref") || undefined;
-  const pull = await fetchGithubPhpSource("szzdmj", "wasmphp", "public/index.php", ref);
-  if (!pull.ok) return textResponse(pull.err || "Fetch error", 502);
-  const ini = parseIniParams(url); // 支持 ?d= 覆盖
-  const argv = buildArgvForCode(pull.code!, ini);
-  const res = await createPhpModuleAndRun(argv, 10000);
-  const debugMode = url.searchParams.get("debug") === "1" || url.searchParams.get("showstderr") === "1";
-
-  if (!res.ok) {
-    const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
-    return textResponse(body, 500);
-  }
-  const stdout = res.stdout.join("\n");
-  const { kept: errKept } = filterKnownNoise(res.stderr, debugMode);
-  const err = errKept.join("\n");
-  const ct = inferContentTypeFromOutput(stdout, "text/html; charset=utf-8");
-  const trace = res.debug.length ? `\n<!-- trace:${res.debug.join("->")} -->` : "";
-  const body = (stdout || err || "") + trace;
-  const status = stdout ? 200 : err ? 500 : typeof res.exitStatus === "number" ? (res.exitStatus === 0 ? 204 : 500) : 204;
-  return new Response(body, { status, headers: { "content-type": ct } });
-}
-
-async function routeVersion(): Promise<Response> {
-  const argv: string[] = [];
-  for (const d of DEFAULT_INIS) { argv.push("-d", d); }
-  argv.push("-v");
-  const res = await createPhpModuleAndRun(argv);
-  const body = (res.stdout.join("\n") || res.stderr.join("\n") || "") + (res.debug.length ? `\ntrace:${res.debug.join("->")}` : "");
-  return textResponse(body || "", res.ok ? 200 : 500);
-}
-
-async function routeHelp(): Promise<Response> {
-  const argv: string[] = [];
-  for (const d of DEFAULT_INIS) { argv.push("-d", d); }
-  argv.push("-h");
-  const res = await createPhpModuleAndRun(argv);
-  const body = (res.stdout.join("\n") || res.stderr.join("\n") || "") + (res.debug.length ? `\ntrace:${res.debug.join("->")}` : "");
-  return textResponse(body || "", res.ok ? 200 : 500);
-}
-
-export default {
-  async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    const { pathname } = url;
-
-    if (pathname === "/health") return textResponse("ok");
-
-    if (pathname === "/__probe") {
-      let importMetaUrl: string | null = null;
-      try { importMetaUrl = (import.meta as any)?.url ?? null; } catch { importMetaUrl = null; }
-      const body = {
-        env: {
-          esm: true,
-          hasWorkerCtor: typeof (globalThis as any).Worker !== "undefined",
-          hasSharedArrayBuffer: typeof (globalThis as any).SharedArrayBuffer !== "undefined",
-          userAgent: (globalThis as any).navigator?.userAgent ?? null,
-        },
-        importMeta: { available: typeof import.meta !== "undefined", url: importMetaUrl },
-      };
-      return new Response(JSON.stringify(body, null, 2), { status: 200, headers: { "content-type": "application/json; charset=utf-8" } });
-    }
-
-    if (pathname === "/__jsplus") {
-      try {
-        const mod = await import("../scripts/php_8_4.js");
-        const def = (mod as any)?.default ?? null;
-        const hasFactory = typeof def === "function";
-        const payload = { imported: true, hasDefaultFactory: hasFactory, exportKeys: Object.keys(mod || {}), note: "仅探测模块导出形态，不触发初始化。" };
-        return new Response(JSON.stringify(payload, null, 2), { status: 200, headers: { "content-type": "application/json; charset=utf-8" } });
-      } catch (e: any) {
-        return textResponse("Import glue failed:\n" + (e?.stack || String(e)), 500);
+    // fallback: master
+    if (branch !== "master") {
+      const u2 = `https://raw.githubusercontent.com/${owner}/${repo}/master/${path.replace(/^\/+/, "")}`;
+      res = await fetch(u2, { method: "GET", headers });
+      if (res.ok) {
+        const txt2 = await res.text();
+        return { ok: true, code: normalizePhpCodeForEval(txt2), status: res.status };
       }
     }
+    return { ok: false, err: `Raw fetch failed: ${owner}/${repo}:${branch}/${path} (${res.status})`, status: res.status };
+  } catch (e: any) {
+    return { ok: false, err: "Raw fetch threw: " + (e?.message || String(e)) };
+  }
+}
 
-    if (pathname === "/__mod") {
-      const argv = buildArgvForCode("echo 'ok';");
-      const res = await createPhpModuleAndRun(argv);
-      const summary = res.ok
-        ? {
-            keys: res.php ? Object.keys(res.php) : [],
-            has: {
-              callMain: typeof (res.php as any)?.callMain === "function",
-              run: typeof (res.php as any)?.run === "function",
-              ccall: typeof (res.php as any)?.ccall === "function",
-              cwrap: typeof (res.php as any)?.cwrap === "function",
-              _main: typeof (res.php as any)?._main === "function",
-              FS: !!(res.php as any)?.FS,
-            },
-            calledRun: (res.php as any)?.calledRun ?? undefined,
-            exitStatus: res.exitStatus ?? undefined,
-            trace: res.debug,
-            stdoutSample: (res.stdout || []).slice(0, 2),
-            stderrSample: (res.stderr || []).slice(0, 2),
-          }
-        : { error: res.error, trace: res.debug, stderr: res.stderr.slice(0, 5) };
-      return new Response(JSON.stringify(summary, null, 2), { status: 200, headers: { "content-type": "application/json; charset=utf-8" } });
+// ——— Routes ———
+async function routeInfo(url: URL): Promise<Response> {
+  try {
+    const argv = buildArgvForCode("phpinfo();");
+    const res = await createPhpModuleAndRun(argv);
+    const debugMode = url.searchParams.get("debug") === "1" || url.searchParams.get("showstderr") === "1";
+    if (!res.ok) {
+      const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
+      return textResponse(body, 500);
     }
+    const stdout = res.stdout.join("\n");
+    const { kept: errKept } = filterKnownNoise(res.stderr, debugMode);
+    const err = errKept.join("\n");
+    const ct = inferContentTypeFromOutput(stdout, "text/html; charset=utf-8");
+    const trace = res.debug.length ? `\n<!-- trace:${res.debug.join("->")} -->` : "";
+    const body = (stdout || err || "") + trace;
+    const status = stdout ? 200 : err ? 500 : typeof res.exitStatus === "number" ? (res.exitStatus === 0 ? 204 : 500) : 204;
+    return new Response(body, { status, headers: { "content-type": ct } });
+  } catch (e: any) {
+    return textResponse("routeInfo error: " + (e?.stack || String(e)), 500);
+  }
+}
 
-    if (pathname === "/" || pathname === "/index.php" || pathname === "/info") {
-      return routeInfo(url);
-    }
-
-    if (pathname === "/public/index.php") {
-      return routeRepoIndex(url);
-    }
-
-    if (pathname === "/run" && request.method === "GET") {
-      return routeRunGET(url);
-    }
-    if (pathname === "/run" && request.method === "POST") {
-      return routeRunPOST(request, url);
-    }
-
-    if (pathname === "/version") return routeVersion();
-    if (pathname === "/help") return routeHelp();
-
-    return textResponse("Not Found", 404);
-  },
-};
+async function routeRunGET(url: URL): Promise<Response> {
+  try {
+    const codeRaw = url.searchParams.get("
