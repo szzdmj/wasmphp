@@ -1,4 +1,4 @@
-// V66d: when PHP produces no stdout/stderr, return a helpful message instead of a blank body.
+// V66e: Execute /public/index.php via eval(base64_decode(...)) to avoid -r multiline/encoding pitfalls.
 // Keep: hardened against 1101, stderr noise filtering, default JIT disabled, __net, /public raw, full try/catch.
 
 import wasmAsset from "../scripts/php_8_4.wasm";
@@ -193,7 +193,7 @@ function inferContentTypeFromOutput(stdout: string, fallback = "text/plain; char
   return fallback;
 }
 
-// Unified finalizer to avoid 204-with-body and provide helpful diagnostics on empty output
+// Unified finalizer
 function finalizeOk(url: URL, res: RunResult, defaultCT: string) {
   const debugMode = url.searchParams.get("debug") === "1" || url.searchParams.get("showstderr") === "1";
   const stdout = res.stdout.join("\n");
@@ -211,7 +211,6 @@ function finalizeOk(url: URL, res: RunResult, defaultCT: string) {
     body = err + trace;
     status = 500;
   } else {
-    // No stdout nor stderr: show a small hint to help diagnose
     const hint = [
       "[wasmphp] No output from PHP script.",
       `exitStatus=${typeof res.exitStatus === "number" ? res.exitStatus : "unknown"}`,
@@ -220,7 +219,6 @@ function finalizeOk(url: URL, res: RunResult, defaultCT: string) {
       "Tip: append ?debug=1 to see unfiltered stderr.",
     ].filter(Boolean).join("\n");
     body = hint;
-    // Keep 200; this is not a hard error, just informative
     status = 200;
   }
 
@@ -236,6 +234,18 @@ function normalizePhpCodeForEval(src: string): string {
   else if (s.startsWith("<?")) s = s.slice(2);
   s = s.replace(/\?>\s*$/s, "");
   return s;
+}
+
+// base64 (UTF-8) helper safe for large inputs
+function toBase64Utf8(s: string): string {
+  const bytes = new TextEncoder().encode(s);
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  // btoa is available in Workers
+  return btoa(binary);
 }
 
 async function fetchGithubPhpSource(owner: string, repo: string, path: string, ref?: string): Promise<{ ok: boolean; code?: string; err?: string; status?: number }> {
@@ -328,8 +338,13 @@ async function routeRepoIndex(url: URL): Promise<Response> {
       return new Response(pull.code || "", { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
     }
 
+    // Execute via base64-eval to avoid -r multiline/encoding issues
+    const codeNormalized = pull.code!;
+    const b64 = toBase64Utf8(codeNormalized);
+    const oneLiner = `eval(base64_decode('${b64}'));`;
+
     const ini = parseIniParams(url);
-    const argv = buildArgvForCode(pull.code!, ini);
+    const argv = buildArgvForCode(oneLiner, ini);
     const res = await createPhpModuleAndRun(argv, 10000);
     if (!res.ok) {
       const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
