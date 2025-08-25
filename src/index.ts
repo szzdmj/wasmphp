@@ -1,5 +1,7 @@
-// V66g: switch to explicit callMain() and write MEMFS after init (no preRun), fix "Could not open input file" and no-output.
-// Keep: hardened against 1101, stderr noise filtering, default JIT disabled, __net, /public raw, helpful empty-output hint.
+// V66h: Smart runner with fallback when callMain/run are missing.
+// - Try callMain: supports MEMFS write + -f path
+// - Fallback to auto-run (noInitialRun=false + arguments) with -r eval(base64_decode(...))
+// - Keep: hardened against 1101, stderr noise filtering, default JIT disabled, __net, raw mode, helpful empty-output hint.
 
 import wasmAsset from "../scripts/php_8_4.wasm";
 
@@ -82,9 +84,8 @@ function buildArgvForFile(path: string, iniList: string[] = []): string[] {
   return argv;
 }
 
-async function buildModuleOptions() {
+async function buildInitOptions(base: Partial<any>) {
   const opts: any = {
-    // We will call callMain() explicitly.
     noInitialRun: true,
     print: () => {},
     printErr: () => {},
@@ -93,13 +94,13 @@ async function buildModuleOptions() {
       (opts as any).__exitStatus = status;
       (opts as any).__exitThrown = toThrow ? String(toThrow) : "";
     },
+    ...base,
   };
 
   if (isWasmModule(wasmAsset)) {
     opts.instantiateWasm = makeInstantiateWithModule(wasmAsset as WebAssembly.Module);
     return opts;
   }
-
   if (typeof wasmAsset === "string") {
     const res = await fetch(wasmAsset);
     if (!res.ok) throw new Error(`Failed to fetch wasm from URL: ${res.status}`);
@@ -107,109 +108,122 @@ async function buildModuleOptions() {
     opts.wasmBinary = new Uint8Array(buf);
     return opts;
   }
-
   if (wasmAsset instanceof ArrayBuffer) {
     opts.wasmBinary = new Uint8Array(wasmAsset);
     return opts;
   }
-
   if (ArrayBuffer.isView(wasmAsset)) {
     const view = wasmAsset as ArrayBufferView;
     opts.wasmBinary = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
     return opts;
   }
-
   throw new Error("Unsupported wasm asset type at runtime");
 }
 
-async function createPhpModuleAndRunExplicit(argv: string[], waitMs = 8000, afterInit?: (php: any) => void): Promise<RunResult> {
+// Initialize module once (noInitialRun=true)
+async function initPhpModule(): Promise<{ php: any; moduleOptions: any; stdout: string[]; stderr: string[]; debug: string[] }> {
   const debug: string[] = [];
   const stdout: string[] = [];
   const stderr: string[] = [];
-  let exitStatus: number | undefined;
+  debug.push("step:import-glue");
+  const phpModule = await import("../scripts/php_8_4.js");
+  const initCandidate = (phpModule as any).init || (phpModule as any).default || (phpModule as any);
+  if (typeof initCandidate !== "function") throw new Error("PHP init factory not found on module export");
 
+  debug.push("step:build-options");
+  const moduleOptions: any = await buildInitOptions({});
+  moduleOptions.print = (txt: string) => { try { stdout.push(String(txt)); } catch {} };
+  moduleOptions.printErr = (txt: string) => { try { stderr.push(String(txt)); } catch {} };
+  moduleOptions.onRuntimeInitialized = () => { debug.push("event:onRuntimeInitialized"); };
+
+  debug.push("step:init-factory");
+  let php: any;
   try {
-    debug.push("step:import-glue");
-    const phpModule = await import("../scripts/php_8_4.js");
-    const initCandidate = (phpModule as any).init || (phpModule as any).default || (phpModule as any);
-    if (typeof initCandidate !== "function") {
-      return { ok: false, stdout, stderr, debug,
-        error: "PHP init function not found on module export. Ensure -s MODULARIZE=1 -s EXPORT_ES6=1. Exports: " + Object.keys(phpModule || {}).join(", "),
-      };
-    }
-
-    debug.push("step:build-options");
-    const moduleOptions: any = await buildModuleOptions();
-    moduleOptions.print = (txt: string) => { try { stdout.push(String(txt)); } catch {} };
-    moduleOptions.printErr = (txt: string) => { try { stderr.push(String(txt)); } catch {} };
-    moduleOptions.onRuntimeInitialized = () => { debug.push("event:onRuntimeInitialized"); };
-
-    debug.push("step:init-factory");
-    let php: any;
+    php = await (initCandidate as any)(moduleOptions);
+  } catch (e1: any) {
     try {
-      php = await (initCandidate as any)(moduleOptions);
-    } catch (e1: any) {
-      try {
-        php = await (initCandidate as any)("WORKER", moduleOptions);
-        debug.push("factory:retry-with-WORKER:ok");
-      } catch (e2: any) {
-        return { ok: false, stdout, stderr, debug,
-          error: "PHP factory invocation failed.\nFirst error: " + (e1?.stack || e1) + "\nRetry error: " + (e2?.stack || e2),
-        };
-      }
+      php = await (initCandidate as any)("WORKER", moduleOptions);
+      debug.push("factory:retry-with-WORKER:ok");
+    } catch (e2: any) {
+      throw new Error("PHP factory invocation failed: " + (e1?.message || e1) + " / " + (e2?.message || e2));
     }
+  }
+  return { php, moduleOptions, stdout, stderr, debug };
+}
 
-    // Allow caller to manipulate FS before running main
+// Run via callMain if available
+async function runViaCallMain(argv: string[], waitMs = 8000, afterInit?: (php: any) => void): Promise<RunResult> {
+  try {
+    const { php, moduleOptions, stdout, stderr, debug } = await initPhpModule();
+
     if (afterInit) {
       try { afterInit(php); } catch (e: any) { stderr.push("afterInit error: " + (e?.message || String(e))); }
     }
 
-    // Build full argv with a fake program name
+    const hasCallMain = typeof (php as any).callMain === "function";
+    const hasRun = typeof (php as any).run === "function";
+    if (!hasCallMain && !hasRun) {
+      return { ok: false, stdout, stderr, debug: [...debug, "step:callMain"], error: "No runnable entry point (callMain/run) found on Module." };
+    }
+
     const fullArgv = ["php", ...argv];
-
-    debug.push("step:callMain");
     let ran = false;
-    try {
-      if (typeof (php as any).callMain === "function") {
-        (php as any).callMain(fullArgv);
-        ran = true;
-        debug.push("callMain:ok");
-      }
-    } catch (e: any) {
-      stderr.push("callMain threw: " + (e?.message || String(e)));
+
+    if (hasCallMain) {
+      debug.push("step:callMain");
+      try { (php as any).callMain(fullArgv); ran = true; debug.push("callMain:ok"); } catch (e: any) { stderr.push("callMain threw: " + (e?.message || String(e))); }
+    }
+    if (!ran && hasRun) {
+      try { (php as any).arguments = fullArgv.slice(1); (php as any).run(); ran = true; debug.push("run():ok"); } catch (e: any) { stderr.push("run() threw: " + (e?.message || String(e))); }
     }
 
-    if (!ran && typeof (php as any).run === "function") {
-      try {
-        // Some builds honor Module.arguments; supply and run()
-        (php as any).arguments = fullArgv.slice(1); // run() often ignores the program name
-        (php as any).run();
-        ran = true;
-        debug.push("run():ok");
-      } catch (e: any) {
-        stderr.push("run() threw: " + (e?.message || String(e)));
-      }
-    }
-
-    if (!ran) {
-      return { ok: false, stdout, stderr, debug, error: "No runnable entry point (callMain/run) found on Module." };
-    }
-
-    // Wait briefly to ensure prints are flushed and quit captured
     const start = Date.now();
     while (Date.now() - start < waitMs) {
-      if (typeof moduleOptions.__exitStatus === "number") {
-        exitStatus = moduleOptions.__exitStatus;
-        debug.push("exit:" + String(exitStatus));
-        break;
-      }
+      if (typeof moduleOptions.__exitStatus === "number") { debug.push("exit:" + String(moduleOptions.__exitStatus)); break; }
       if (stdout.length > 0) break;
-      await new Promise((r) => setTimeout(r, 25));
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    return { ok: true, stdout, stderr, debug, php, exitStatus: moduleOptions.__exitStatus };
+  } catch (e: any) {
+    return { ok: false, stdout: [], stderr: [], debug: ["catch-top", e?.message || String(e)], error: e?.stack || String(e) };
+  }
+}
+
+// Fallback: auto-run with arguments (noInitialRun=false)
+async function runViaAutoRun(argv: string[], waitMs = 8000): Promise<RunResult> {
+  const debug: string[] = [];
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  let exitStatus: number | undefined;
+  try {
+    debug.push("fallback:autoRun:import-glue");
+    const phpModule = await import("../scripts/php_8_4.js");
+    const initCandidate = (phpModule as any).init || (phpModule as any).default || (phpModule as any);
+    if (typeof initCandidate !== "function") {
+      return { ok: false, stdout, stderr, debug, error: "PHP init factory not found" };
+    }
+    debug.push("fallback:autoRun:build-options");
+    const moduleOptions: any = await buildInitOptions({ noInitialRun: false, arguments: ["php", ...argv] });
+    moduleOptions.print = (txt: string) => { try { stdout.push(String(txt)); } catch {} };
+    moduleOptions.printErr = (txt: string) => { try { stderr.push(String(txt)); } catch {} };
+    moduleOptions.onRuntimeInitialized = () => { debug.push("fallback:autoRun:event:onRuntimeInitialized"); };
+
+    debug.push("fallback:autoRun:init-factory");
+    try { await (initCandidate as any)(moduleOptions); } catch (e1: any) {
+      try { await (initCandidate as any)("WORKER", moduleOptions); debug.push("fallback:autoRun:factory:WORKER:ok"); } catch (e2: any) {
+        return { ok: false, stdout, stderr, debug, error: "autoRun factory failed: " + (e1?.message || e1) + " / " + (e2?.message || e2) };
+      }
     }
 
-    return { ok: true, stdout, stderr, debug, php, exitStatus };
+    const start = Date.now();
+    while (Date.now() - start < waitMs) {
+      if (typeof moduleOptions.__exitStatus === "number") { exitStatus = moduleOptions.__exitStatus; debug.push("fallback:autoRun:exit:" + String(exitStatus)); break; }
+      if (stdout.length > 0) break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    return { ok: true, stdout, stderr, debug, exitStatus };
   } catch (e: any) {
-    return { ok: false, stdout, stderr, debug: ["catch-top", e?.message || String(e)], error: e?.stack || String(e) };
+    return { ok: false, stdout, stderr, debug: ["fallback:autoRun:catch-top", e?.message || String(e)], error: e?.stack || String(e) };
   }
 }
 
@@ -305,11 +319,25 @@ async function fetchGithubPhpSource(owner: string, repo: string, path: string, r
   }
 }
 
+// Base64 (UTF-8) helper
+function toBase64Utf8(s: string): string {
+  const bytes = new TextEncoder().encode(s);
+  let bin = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) bin += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  return btoa(bin);
+}
+
 // ——— Routes ———
 async function routeInfo(url: URL): Promise<Response> {
   try {
     const argv = buildArgvForCode("phpinfo();");
-    const res = await createPhpModuleAndRunExplicit(argv);
+    // Try callMain -> fallback auto-run
+    let res = await runViaCallMain(argv);
+    if (!res.ok && (res.error || "").includes("No runnable entry point")) {
+      res = await runViaAutoRun(argv);
+      res.debug.unshift("fallback:autoRun");
+    }
     if (!res.ok) {
       const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
       return textResponse(body, 500);
@@ -327,7 +355,12 @@ async function routeRunGET(url: URL): Promise<Response> {
     if (codeRaw.length > 64 * 1024) return textResponse("Payload Too Large", 413);
     const ini = parseIniParams(url);
     const argv = buildArgvForCode(codeRaw, ini);
-    const res = await createPhpModuleAndRunExplicit(argv);
+
+    let res = await runViaCallMain(argv);
+    if (!res.ok && (res.error || "").includes("No runnable entry point")) {
+      res = await runViaAutoRun(argv);
+      res.debug.unshift("fallback:autoRun");
+    }
     if (!res.ok) {
       const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
       return textResponse(body, 500);
@@ -345,7 +378,12 @@ async function routeRunPOST(request: Request, url: URL): Promise<Response> {
     if (code.length > 256 * 1024) return textResponse("Payload Too Large", 413);
     const ini = parseIniParams(url);
     const argv = buildArgvForCode(code, ini);
-    const res = await createPhpModuleAndRunExplicit(argv, 10000);
+
+    let res = await runViaCallMain(argv, 10000);
+    if (!res.ok && (res.error || "").includes("No runnable entry point")) {
+      res = await runViaAutoRun(argv, 10000);
+      res.debug.unshift("fallback:autoRun");
+    }
     if (!res.ok) {
       const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
       return textResponse(body, 500);
@@ -370,19 +408,27 @@ async function routeRepoIndex(url: URL): Promise<Response> {
     const codeNormalized = pull.code || "";
     const filePath = "/tmp/public_index.php";
     const ini = parseIniParams(url);
-    const argv = buildArgvForFile(filePath, ini);
 
-    const res = await createPhpModuleAndRunExplicit(argv, 10000, (php) => {
+    // Try best path: write MEMFS + -f (requires callMain)
+    const argvFile = buildArgvForFile(filePath, ini);
+    let res = await runViaCallMain(argvFile, 10000, (php) => {
       try {
         const FS = (php as any).FS;
         if (!FS) return;
         try { FS.mkdir("/tmp"); } catch {}
         const bytes = new TextEncoder().encode(codeNormalized);
         FS.writeFile(filePath, bytes);
-      } catch (e) {
-        // swallow; error will surface if file missing
-      }
+      } catch {}
     });
+
+    // Fallback: -r eval(base64_decode(...)) with auto-run (no MEMFS required)
+    if (!res.ok && (res.error || "").includes("No runnable entry point")) {
+      const b64 = toBase64Utf8(codeNormalized);
+      const oneLiner = `eval(base64_decode('${b64}'));`;
+      const argvR = buildArgvForCode(oneLiner, ini);
+      res = await runViaAutoRun(argvR, 10000);
+      res.debug.unshift("fallback:autoRun");
+    }
 
     if (!res.ok) {
       const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
@@ -399,7 +445,12 @@ async function routeVersion(): Promise<Response> {
     const argv: string[] = [];
     for (const d of DEFAULT_INIS) { argv.push("-d", d); }
     argv.push("-v");
-    const res = await createPhpModuleAndRunExplicit(argv);
+    // Prefer callMain, fallback auto-run
+    let res = await runViaCallMain(argv);
+    if (!res.ok && (res.error || "").includes("No runnable entry point")) {
+      res = await runViaAutoRun(argv);
+      res.debug.unshift("fallback:autoRun");
+    }
     const body = (res.stdout.join("\n") || res.stderr.join("\n") || "") + (res.debug.length ? `\ntrace:${res.debug.join("->")}` : "");
     return textResponse(body || "", res.ok ? 200 : 500);
   } catch (e: any) {
@@ -412,7 +463,11 @@ async function routeHelp(): Promise<Response> {
     const argv: string[] = [];
     for (const d of DEFAULT_INIS) { argv.push("-d", d); }
     argv.push("-h");
-    const res = await createPhpModuleAndRunExplicit(argv);
+    let res = await runViaCallMain(argv);
+    if (!res.ok && (res.error || "").includes("No runnable entry point")) {
+      res = await runViaAutoRun(argv);
+      res.debug.unshift("fallback:autoRun");
+    }
     const body = (res.stdout.join("\n") || res.stderr.join("\n") || "") + (res.debug.length ? `\ntrace:${res.debug.join("->")}` : "");
     return textResponse(body || "", res.ok ? 200 : 500);
   } catch (e: any) {
@@ -471,26 +526,22 @@ export default {
 
       if (pathname === "/__mod") {
         try {
-          const argv = buildArgvForCode("echo 'ok';");
-          const res = await createPhpModuleAndRunExplicit(argv);
-          const summary = res.ok
-            ? {
-                keys: res.php ? Object.keys(res.php) : [],
-                has: {
-                  callMain: typeof (res.php as any)?.callMain === "function",
-                  run: typeof (res.php as any)?.run === "function",
-                  ccall: typeof (res.php as any)?.ccall === "function",
-                  cwrap: typeof (res.php as any)?.cwrap === "function",
-                  _main: typeof (res.php as any)?._main === "function",
-                  FS: !!(res.php as any)?.FS,
-                },
-                calledRun: (res.php as any)?.calledRun ?? undefined,
-                exitStatus: res.exitStatus ?? undefined,
-                trace: res.debug,
-                stdoutSample: (res.stdout || []).slice(0, 2),
-                stderrSample: (res.stderr || []).slice(0, 2),
-              }
-            : { error: res.error, trace: res.debug, stderr: res.stderr.slice(0, 5) };
+          // Probe available entry points
+          const { php, moduleOptions, stdout, stderr, debug } = await initPhpModule();
+          const summary = {
+            keys: php ? Object.keys(php) : [],
+            has: {
+              callMain: typeof (php as any)?.callMain === "function",
+              run: typeof (php as any)?.run === "function",
+              ccall: typeof (php as any)?.ccall === "function",
+              cwrap: typeof (php as any)?.cwrap === "function",
+              _main: typeof (php as any)?._main === "function",
+              FS: !!(php as any)?.FS,
+              wasmExports: !!(php as any)?.wasmExports,
+            },
+            calledRun: (php as any)?.calledRun ?? undefined,
+            trace: debug,
+          };
           return new Response(JSON.stringify(summary, null, 2), { status: 200, headers: { "content-type": "application/json; charset=utf-8" } });
         } catch (e: any) {
           return textResponse("mod error: " + (e?.stack || String(e)), 500);
