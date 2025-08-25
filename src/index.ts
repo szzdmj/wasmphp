@@ -1,4 +1,9 @@
-// V66k + R2: 在 V66k 基础上增加 R2 源码读取（默认 key=public/index.php）
+// V66k + KV: 在 V66k 基础上增加 Workers KV 源码读取与可选上传接口。
+// - 保持 V66k 执行器：auto-run(noInitialRun=false) + -r + base64 eval + register_shutdown_function("\n")。
+// - 首页与 /public/index.php 从 KV 读取（key=public/index.php），失败时回退 GitHub Raw（可保留容灾）。
+// - 提供 /__kv 诊断与 /__put 上传（需 ADMIN_TOKEN Secret）。
+// - 仍然不依赖 FS（/__mod 显示 FS:false），因此多文件建议“Bundle 模式”或 manifest 组装。
+
 import wasmAsset from "../scripts/php_8_4.wasm";
 
 // Minimal globals for Emscripten glue in Workers
@@ -40,7 +45,6 @@ type RunResult = {
 function isWasmModule(x: any): x is WebAssembly.Module {
   return Object.prototype.toString.call(x) === "[object WebAssembly.Module]";
 }
-
 function makeInstantiateWithModule(wasmModule: WebAssembly.Module) {
   return (imports: WebAssembly.Imports, successCallback: (i: WebAssembly.Instance) => void) => {
     const instance = new WebAssembly.Instance(wasmModule, imports);
@@ -52,7 +56,6 @@ function makeInstantiateWithModule(wasmModule: WebAssembly.Module) {
 function textResponse(body: string, status = 200, headers: Record<string, string> = {}) {
   return new Response(body, { status, headers: { "content-type": "text/plain; charset=utf-8", ...headers } });
 }
-
 function parseIniParams(url: URL): string[] {
   const out: string[] = [];
   const ds = url.searchParams.getAll("d").concat(url.searchParams.getAll("ini"));
@@ -62,7 +65,6 @@ function parseIniParams(url: URL): string[] {
   }
   return out;
 }
-
 function buildArgvForCode(code: string, iniList: string[] = []): string[] {
   const argv: string[] = [];
   for (const d of DEFAULT_INIS) argv.push("-d", d);
@@ -70,7 +72,6 @@ function buildArgvForCode(code: string, iniList: string[] = []): string[] {
   argv.push("-r", code);
   return argv;
 }
-
 async function buildInitOptions(base: Partial<any>) {
   const opts: any = {
     noInitialRun: false, // auto-run
@@ -160,13 +161,10 @@ function filterKnownNoise(lines: string[], keepAll: boolean) {
   });
   return { kept, ignored };
 }
-
 function inferContentTypeFromOutput(stdout: string, fallback = "text/plain; charset=utf-8") {
   if (stdout.includes("<html") || stdout.includes("<!DOCTYPE html")) return "text/html; charset=utf-8";
   return fallback;
 }
-
-// Unified finalizer with diagnostics when both stdout/stderr are empty
 function finalizeOk(url: URL, res: RunResult, defaultCT: string) {
   const debugMode = url.searchParams.get("debug") === "1" || url.searchParams.get("showstderr") === "1";
   const stdout = res.stdout.join("\n");
@@ -194,11 +192,10 @@ function finalizeOk(url: URL, res: RunResult, defaultCT: string) {
     body = hint;
     status = 200;
   }
-
   return new Response(body, { status, headers: { "content-type": ct } });
 }
 
-// —— Sources: R2 first, then GitHub fallback ——
+// —— Sources: KV first, then GitHub fallback ——
 function normalizePhpCodeForEval(src: string): string {
   let s = src.trimStart();
   if (s.charCodeAt(0) === 0xfeff) s = s.slice(1);
@@ -207,21 +204,18 @@ function normalizePhpCodeForEval(src: string): string {
   s = s.replace(/\?>\s*$/s, "");
   return s;
 }
-
-async function fetchR2PhpSource(env: any, key: string): Promise<{ ok: boolean; code?: string; err?: string }> {
+async function fetchKVPhpSource(env: any, key: string): Promise<{ ok: boolean; code?: string; err?: string }> {
   try {
     if (!env || !env.SRC || typeof env.SRC.get !== "function") {
-      return { ok: false, err: "R2 binding SRC is not configured" };
+      return { ok: false, err: "KV binding SRC is not configured" };
     }
-    const obj = await env.SRC.get(key);
-    if (!obj) return { ok: false, err: `R2 object not found: ${key}` };
-    const txt = await obj.text();
+    const txt = await env.SRC.get(key, "text");
+    if (txt == null) return { ok: false, err: `KV object not found: ${key}` };
     return { ok: true, code: normalizePhpCodeForEval(txt) };
   } catch (e: any) {
-    return { ok: false, err: "R2 get failed: " + (e?.message || String(e)) };
+    return { ok: false, err: "KV get failed: " + (e?.message || String(e)) };
   }
 }
-
 async function fetchGithubPhpSource(owner: string, repo: string, path: string, ref?: string): Promise<{ ok: boolean; code?: string; err?: string; status?: number }> {
   try {
     const branch = (ref && ref.trim()) || "main";
@@ -249,8 +243,6 @@ async function fetchGithubPhpSource(owner: string, repo: string, path: string, r
     return { ok: false, err: "Raw fetch threw: " + (e?.message || String(e)) };
   }
 }
-
-// Base64 (UTF-8) helper safe for large inputs
 function toBase64Utf8(s: string): string {
   const bytes = new TextEncoder().encode(s);
   let binary = "";
@@ -275,11 +267,9 @@ async function routeInfo(url: URL): Promise<Response> {
     return textResponse("routeInfo error: " + (e?.stack || String(e)), 500);
   }
 }
-
 function wrapCodeWithShutdownNewline(code: string): string {
   return `register_shutdown_function(function(){echo "\\n";}); ${code}`;
 }
-
 async function routeRunGET(url: URL): Promise<Response> {
   try {
     const codeRaw = url.searchParams.get("code") ?? "";
@@ -297,7 +287,6 @@ async function routeRunGET(url: URL): Promise<Response> {
     return textResponse("routeRunGET error: " + (e?.stack || String(e)), 500);
   }
 }
-
 async function routeRunPOST(request: Request, url: URL): Promise<Response> {
   try {
     const code = await request.text();
@@ -315,21 +304,20 @@ async function routeRunPOST(request: Request, url: URL): Promise<Response> {
     return textResponse("routeRunPOST error: " + (e?.stack || String(e)), 500);
   }
 }
-
 async function routeRepoIndex(url: URL, env: any): Promise<Response> {
   try {
     const ref = url.searchParams.get("ref") || undefined;
     const mode = url.searchParams.get("mode") || "";
-    const key = url.searchParams.get("key") || "index.php";
+    const key = url.searchParams.get("key") || "public/index.php";
 
-    // 1) 优先从 R2 读
+    // 1) 优先从 KV 读
     let codeNormalized: string | undefined;
     if (env && env.SRC) {
-      const r2 = await fetchR2PhpSource(env, key);
-      if (r2.ok) codeNormalized = r2.code!;
+      const kv = await fetchKVPhpSource(env, key);
+      if (kv.ok) codeNormalized = kv.code!;
     }
 
-    // 2) R2 没拿到则回退 GitHub（保持原来的容灾）
+    // 2) KV 没拿到则回退 GitHub（容灾）
     if (!codeNormalized) {
       const pull = await fetchGithubPhpSource("szzdmj", "wasmphp", key, ref);
       if (!pull.ok) return textResponse(pull.err || "Fetch error", 502);
@@ -343,7 +331,6 @@ async function routeRepoIndex(url: URL, env: any): Promise<Response> {
       }
     }
 
-    // 执行：base64-eval + shutdown newline 强制 flush
     const b64 = toBase64Utf8(codeNormalized || "");
     const oneLiner = wrapCodeWithShutdownNewline(`eval(base64_decode('${b64}'));`);
     const ini = parseIniParams(url);
@@ -358,7 +345,6 @@ async function routeRepoIndex(url: URL, env: any): Promise<Response> {
     return textResponse("routeRepoIndex error: " + (e?.stack || String(e)), 500);
   }
 }
-
 async function routeVersion(): Promise<Response> {
   try {
     const argv: string[] = [];
@@ -371,7 +357,6 @@ async function routeVersion(): Promise<Response> {
     return textResponse("routeVersion error: " + (e?.stack || String(e)), 500);
   }
 }
-
 async function routeHelp(): Promise<Response> {
   try {
     const argv: string[] = [];
@@ -385,13 +370,37 @@ async function routeHelp(): Promise<Response> {
   }
 }
 
-async function routeNet(url: URL, env: any): Promise<Response> {
+// —— KV 诊断与受保护上传 —— //
+async function routeKvDiag(url: URL, env: any): Promise<Response> {
   try {
     const key = url.searchParams.get("key") || "public/index.php";
-    const r2 = await fetchR2PhpSource(env, key);
-    return new Response(JSON.stringify(r2, null, 2), { status: r2.ok ? 200 : 502, headers: { "content-type": "application/json; charset=utf-8" } });
+    const r = await fetchKVPhpSource(env, key);
+    return new Response(JSON.stringify(r, null, 2), { status: r.ok ? 200 : 502, headers: { "content-type": "application/json; charset=utf-8" } });
   } catch (e: any) {
-    return textResponse("net error: " + (e?.stack || String(e)), 500);
+    return textResponse("kv diag error: " + (e?.stack || String(e)), 500);
+  }
+}
+function badKey(key: string) {
+  // 简单校验，避免非法 key
+  return key.length > 512 || key.includes("..") || key.startsWith("/") || key === "";
+}
+async function routeKvPut(request: Request, url: URL, env: any): Promise<Response> {
+  try {
+    if (!env?.SRC || typeof env.SRC.put !== "function") return textResponse("KV not configured", 500);
+    const admin = (env as any).ADMIN_TOKEN;
+    const token = request.headers.get("x-admin-token") || request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
+    if (!admin || token !== admin) return textResponse("Unauthorized", 401);
+
+    const key = url.searchParams.get("key") || "";
+    if (badKey(key)) return textResponse("Bad key", 400);
+
+    const body = await request.text();
+    if (!body) return textResponse("Empty body", 400);
+
+    await env.SRC.put(key, body, { expirationTtl: 0, metadata: { updatedAt: Date.now() } });
+    return textResponse("OK", 200);
+  } catch (e: any) {
+    return textResponse("kv put error: " + (e?.stack || String(e)), 500);
   }
 }
 
@@ -413,7 +422,7 @@ export default {
               hasWorkerCtor: typeof (globalThis as any).Worker !== "undefined",
               hasSharedArrayBuffer: typeof (globalThis as any).SharedArrayBuffer !== "undefined",
               userAgent: (globalThis as any).navigator?.userAgent ?? null,
-              hasR2: !!env?.SRC,
+              hasKV: !!env?.SRC,
             },
             importMeta: { available: typeof import.meta !== "undefined", url: importMetaUrl },
           };
@@ -435,31 +444,21 @@ export default {
         }
       }
 
-      if (pathname === "/__net") {
-        return routeNet(url, env);
+      if (pathname === "/__kv") {
+        return routeKvDiag(url, env);
+      }
+      if (pathname === "/__put" && (request.method === "POST" || request.method === "PUT")) {
+        return routeKvPut(request, url, env);
       }
 
-      // Home: render repo's /public/index.php from R2 (fallback GitHub)
-      if (pathname === "/" || pathname === "/index.php") {
+      // Home: render KV's /public/index.php (fallback GitHub)
+      if (pathname === "/" || pathname === "/index.php" || pathname === "/public/index.php") {
         return routeRepoIndex(url, env);
       }
 
-      // phpinfo on /info
-      if (pathname === "/info") {
-        return routeInfo(url);
-      }
-
-      if (pathname === "/public/index.php") {
-        return routeRepoIndex(url, env);
-      }
-
-      if (pathname === "/run" && request.method === "GET") {
-        return routeRunGET(url);
-      }
-      if (pathname === "/run" && request.method === "POST") {
-        return routeRunPOST(request, url);
-      }
-
+      if (pathname === "/info") return routeInfo(url);
+      if (pathname === "/run" && request.method === "GET") return routeRunGET(url);
+      if (pathname === "/run" && request.method === "POST") return routeRunPOST(request, url);
       if (pathname === "/version") return routeVersion();
       if (pathname === "/help") return routeHelp();
 
