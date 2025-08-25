@@ -1,7 +1,10 @@
-// V35 执行版（更彻底禁用 JIT/映射 + 修正输出缓冲 + /public 支持自定义 ini）
-// - 默认禁用 PCRE JIT、Opcache（包含 enable 与 JIT）、并关闭输出缓冲让 echo 立即可见
-// - /public/index.php 支持 ?d=key=value 附加 ini，便于临时排查
-// - 构建形态：Emscripten minimal runtime（无 callMain/run），使用 noInitialRun=false + arguments
+// V36 执行版（过滤无害 stderr 噪声 + 调试开关）
+// - 继续默认禁用 JIT/映射（pcre/opcache），并关闭输出缓冲
+// - 默认过滤 stderr 中的 “munmap() failed: [28] Invalid argument” 噪声
+// - ?debug=1 或 ?showstderr=1 时不过滤，完整输出 stderr
+// - stdout 一旦有内容，HTTP 状态码固定 200，避免被无害 stderr 影响
+//
+// 构建形态：Emscripten minimal runtime（无 callMain/run），使用 noInitialRun=false + arguments
 
 import wasmAsset from "../scripts/php_8_4.wasm";
 
@@ -18,20 +21,17 @@ import wasmAsset from "../scripts/php_8_4.wasm";
   }
 })();
 
-// 默认 INI（禁用一切可能 mmap 的组件 + 让输出立即可见）
+// 默认 INI（禁用 JIT/缓存 + 让输出立即可见）
 const DEFAULT_INIS = [
-  // 关闭 PCRE 与 Opcache 的 JIT/缓存
   "pcre.jit=0",
   "opcache.enable=0",
   "opcache.enable_cli=0",
   "opcache.jit=0",
   "opcache.jit_buffer_size=0",
   "opcache.file_cache=",
-  // 输出相关：CLI 默认有输出缓冲，关闭并启用即时刷新，避免没换行的 echo 被吞
   "output_buffering=0",
   "implicit_flush=1",
   "zlib.output_compression=0",
-  // 诊断更直观
   "display_errors=1",
   "display_startup_errors=1",
 ];
@@ -74,11 +74,8 @@ function parseIniParams(url: URL): string[] {
 
 function buildArgvForCode(code: string, iniList: string[] = []): string[] {
   const argv: string[] = [];
-  // 默认注入
   for (const d of DEFAULT_INIS) argv.push("-d", d);
-  // 追加调用者传入的 -d
   for (const d of iniList) if (d) argv.push("-d", d);
-  // 使用 -r 执行
   argv.push("-r", code);
   return argv;
 }
@@ -181,20 +178,41 @@ async function createPhpModuleAndRun(argv: string[], waitMs = 8000): Promise<Run
   }
 }
 
+// 过滤已知无害的 stderr 噪声（默认开启，?debug=1 时关闭）
+function filterKnownNoise(lines: string[], keepAll: boolean) {
+  if (keepAll) return { kept: lines.slice(), ignored: 0 };
+  const patterns: RegExp[] = [
+    /^munmap\(\)\s+failed:\s+\[\d+\]\s+Invalid argument/i,
+  ];
+  let ignored = 0;
+  const kept = lines.filter((l) => {
+    const t = String(l || "").trim();
+    if (!t) return false;
+    for (const re of patterns) {
+      if (re.test(t)) { ignored++; return false; }
+    }
+    return true;
+  });
+  return { kept, ignored };
+}
+
 function inferContentTypeFromOutput(stdout: string, fallback = "text/plain; charset=utf-8") {
   if (stdout.includes("<html") || stdout.includes("<!DOCTYPE html")) return "text/html; charset=utf-8";
   return fallback;
 }
 
-async function routeInfo(): Promise<Response> {
+async function routeInfo(url: URL): Promise<Response> {
   const argv = buildArgvForCode("phpinfo();");
   const res = await createPhpModuleAndRun(argv);
+  const debugMode = url.searchParams.get("debug") === "1" || url.searchParams.get("showstderr") === "1";
+
   if (!res.ok) {
     const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
     return textResponse(body, 500);
   }
   const stdout = res.stdout.join("\n");
-  const err = res.stderr.join("\n");
+  const { kept: errKept } = filterKnownNoise(res.stderr, debugMode);
+  const err = errKept.join("\n");
   const ct = inferContentTypeFromOutput(stdout, "text/html; charset=utf-8");
   const trace = res.debug.length ? `\n<!-- trace:${res.debug.join("->")} -->` : "";
   const body = (stdout || err || "") + trace;
@@ -209,12 +227,15 @@ async function routeRunGET(url: URL): Promise<Response> {
   const ini = parseIniParams(url);
   const argv = buildArgvForCode(codeRaw, ini);
   const res = await createPhpModuleAndRun(argv);
+  const debugMode = url.searchParams.get("debug") === "1" || url.searchParams.get("showstderr") === "1";
+
   if (!res.ok) {
     const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
     return textResponse(body, 500);
   }
   const stdout = res.stdout.join("\n");
-  const err = res.stderr.join("\n");
+  const { kept: errKept } = filterKnownNoise(res.stderr, debugMode);
+  const err = errKept.join("\n");
   const ct = inferContentTypeFromOutput(stdout);
   const trace = res.debug.length ? `\n<!-- trace:${res.debug.join("->")} -->` : "";
   const body = (stdout || err || "") + trace;
@@ -229,12 +250,15 @@ async function routeRunPOST(request: Request, url: URL): Promise<Response> {
   const ini = parseIniParams(url);
   const argv = buildArgvForCode(code, ini);
   const res = await createPhpModuleAndRun(argv, 10000);
+  const debugMode = url.searchParams.get("debug") === "1" || url.searchParams.get("showstderr") === "1";
+
   if (!res.ok) {
     const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
     return textResponse(body, 500);
   }
   const stdout = res.stdout.join("\n");
-  const err = res.stderr.join("\n");
+  const { kept: errKept } = filterKnownNoise(res.stderr, debugMode);
+  const err = errKept.join("\n");
   const ct = inferContentTypeFromOutput(stdout);
   const trace = res.debug.length ? `\n<!-- trace:${res.debug.join("->")} -->` : "";
   const body = (stdout || err || "") + trace;
@@ -247,7 +271,7 @@ function normalizePhpCodeForEval(src: string): string {
   let s = src.trimStart();
   if (s.startsWith("<?php")) s = s.slice(5);
   else if (s.startsWith("<?")) s = s.slice(2);
-  s = s.replace(/\?>\s*$/s, ""); // 去掉尾部 ?>（可选）
+  s = s.replace(/\?>\s*$/s, "");
   return s;
 }
 
@@ -281,12 +305,15 @@ async function routeRepoIndex(url: URL): Promise<Response> {
   const ini = parseIniParams(url); // 支持 ?d= 覆盖
   const argv = buildArgvForCode(pull.code!, ini);
   const res = await createPhpModuleAndRun(argv, 10000);
+  const debugMode = url.searchParams.get("debug") === "1" || url.searchParams.get("showstderr") === "1";
+
   if (!res.ok) {
     const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
     return textResponse(body, 500);
   }
   const stdout = res.stdout.join("\n");
-  const err = res.stderr.join("\n");
+  const { kept: errKept } = filterKnownNoise(res.stderr, debugMode);
+  const err = errKept.join("\n");
   const ct = inferContentTypeFromOutput(stdout, "text/html; charset=utf-8");
   const trace = res.debug.length ? `\n<!-- trace:${res.debug.join("->")} -->` : "";
   const body = (stdout || err || "") + trace;
@@ -371,7 +398,7 @@ export default {
     }
 
     if (pathname === "/" || pathname === "/index.php" || pathname === "/info") {
-      return routeInfo();
+      return routeInfo(url);
     }
 
     if (pathname === "/public/index.php") {
