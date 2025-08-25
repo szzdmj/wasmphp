@@ -1,4 +1,5 @@
-// V66a: Hardened against 1101, safer GitHub fetch, raw view for /public, and full try/catch guards.
+// V66b: Fix build error, hardened against 1101, safer GitHub fetch, raw view for /public,
+// stderr noise filtering, default JIT disabled, and full try/catch guards.
 
 import wasmAsset from "../scripts/php_8_4.wasm";
 
@@ -254,4 +255,221 @@ async function routeInfo(url: URL): Promise<Response> {
 
 async function routeRunGET(url: URL): Promise<Response> {
   try {
-    const codeRaw = url.searchParams.get("
+    const codeRaw = url.searchParams.get("code") ?? "";
+    if (!codeRaw) return textResponse("Bad Request: missing code", 400);
+    if (codeRaw.length > 64 * 1024) return textResponse("Payload Too Large", 413);
+    const ini = parseIniParams(url);
+    const argv = buildArgvForCode(codeRaw, ini);
+    const res = await createPhpModuleAndRun(argv);
+    const debugMode = url.searchParams.get("debug") === "1" || url.searchParams.get("showstderr") === "1";
+
+    if (!res.ok) {
+      const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
+      return textResponse(body, 500);
+    }
+    const stdout = res.stdout.join("\n");
+    const { kept: errKept } = filterKnownNoise(res.stderr, debugMode);
+    const err = errKept.join("\n");
+    const ct = inferContentTypeFromOutput(stdout);
+    const trace = res.debug.length ? `\n<!-- trace:${res.debug.join("->")} -->` : "";
+    const body = (stdout || err || "") + trace;
+    const status = stdout ? 200 : err ? 500 : typeof res.exitStatus === "number" ? (res.exitStatus === 0 ? 204 : 500) : 204;
+    return new Response(body, { status, headers: { "content-type": ct } });
+  } catch (e: any) {
+    return textResponse("routeRunGET error: " + (e?.stack || String(e)), 500);
+  }
+}
+
+async function routeRunPOST(request: Request, url: URL): Promise<Response> {
+  try {
+    const code = await request.text();
+    if (!code) return textResponse("Bad Request: empty body", 400);
+    if (code.length > 256 * 1024) return textResponse("Payload Too Large", 413);
+    const ini = parseIniParams(url);
+    const argv = buildArgvForCode(code, ini);
+    const res = await createPhpModuleAndRun(argv, 10000);
+    const debugMode = url.searchParams.get("debug") === "1" || url.searchParams.get("showstderr") === "1";
+
+    if (!res.ok) {
+      const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
+      return textResponse(body, 500);
+    }
+    const stdout = res.stdout.join("\n");
+    const { kept: errKept } = filterKnownNoise(res.stderr, debugMode);
+    const err = errKept.join("\n");
+    const ct = inferContentTypeFromOutput(stdout);
+    const trace = res.debug.length ? `\n<!-- trace:${res.debug.join("->")} -->` : "";
+    const body = (stdout || err || "") + trace;
+    const status = stdout ? 200 : err ? 500 : typeof res.exitStatus === "number" ? (res.exitStatus === 0 ? 204 : 500) : 204;
+    return new Response(body, { status, headers: { "content-type": ct } });
+  } catch (e: any) {
+    return textResponse("routeRunPOST error: " + (e?.stack || String(e)), 500);
+  }
+}
+
+async function routeRepoIndex(url: URL): Promise<Response> {
+  try {
+    const ref = url.searchParams.get("ref") || undefined;
+    const mode = url.searchParams.get("mode") || "";
+    const pull = await fetchGithubPhpSource("szzdmj", "wasmphp", "public/index.php", ref);
+    if (!pull.ok) return textResponse(pull.err || "Fetch error", 502);
+
+    if (mode === "raw") {
+      // Show the raw PHP (normalized) without executing
+      return new Response(pull.code || "", { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+    }
+
+    const ini = parseIniParams(url);
+    const argv = buildArgvForCode(pull.code!, ini);
+    const res = await createPhpModuleAndRun(argv, 10000);
+    const debugMode = url.searchParams.get("debug") === "1" || url.searchParams.get("showstderr") === "1";
+
+    if (!res.ok) {
+      const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
+      return textResponse(body, 500);
+    }
+    const stdout = res.stdout.join("\n");
+    const { kept: errKept } = filterKnownNoise(res.stderr, debugMode);
+    const err = errKept.join("\n");
+    const ct = inferContentTypeFromOutput(stdout, "text/html; charset=utf-8");
+    const trace = res.debug.length ? `\n<!-- trace:${res.debug.join("->")} -->` : "";
+    const body = (stdout || err || "") + trace;
+    const status = stdout ? 200 : err ? 500 : typeof res.exitStatus === "number" ? (res.exitStatus === 0 ? 204 : 500) : 204;
+    return new Response(body, { status, headers: { "content-type": ct } });
+  } catch (e: any) {
+    return textResponse("routeRepoIndex error: " + (e?.stack || String(e)), 500);
+  }
+}
+
+async function routeVersion(): Promise<Response> {
+  try {
+    const argv: string[] = [];
+    for (const d of DEFAULT_INIS) { argv.push("-d", d); }
+    argv.push("-v");
+    const res = await createPhpModuleAndRun(argv);
+    const body = (res.stdout.join("\n") || res.stderr.join("\n") || "") + (res.debug.length ? `\ntrace:${res.debug.join("->")}` : "");
+    return textResponse(body || "", res.ok ? 200 : 500);
+  } catch (e: any) {
+    return textResponse("routeVersion error: " + (e?.stack || String(e)), 500);
+  }
+}
+
+async function routeHelp(): Promise<Response> {
+  try {
+    const argv: string[] = [];
+    for (const d of DEFAULT_INIS) { argv.push("-d", d); }
+    argv.push("-h");
+    const res = await createPhpModuleAndRun(argv);
+    const body = (res.stdout.join("\n") || res.stderr.join("\n") || "") + (res.debug.length ? `\ntrace:${res.debug.join("->")}` : "");
+    return textResponse(body || "", res.ok ? 200 : 500);
+  } catch (e: any) {
+    return textResponse("routeHelp error: " + (e?.stack || String(e)), 500);
+  }
+}
+
+async function routeNet(url: URL): Promise<Response> {
+  try {
+    const ref = url.searchParams.get("ref") || "main";
+    const test = await fetchGithubPhpSource("szzdmj", "wasmphp", "public/index.php", ref);
+    return new Response(JSON.stringify(test, null, 2), { status: test.ok ? 200 : 502, headers: { "content-type": "application/json; charset=utf-8" } });
+  } catch (e: any) {
+    return textResponse("net error: " + (e?.stack || String(e)), 500);
+  }
+}
+
+export default {
+  async fetch(request: Request): Promise<Response> {
+    try {
+      const url = new URL(request.url);
+      const { pathname } = url;
+
+      if (pathname === "/health") return textResponse("ok");
+
+      if (pathname === "/__probe") {
+        try {
+          let importMetaUrl: string | null = null;
+          try { importMetaUrl = (import.meta as any)?.url ?? null; } catch { importMetaUrl = null; }
+          const body = {
+            env: {
+              esm: true,
+              hasWorkerCtor: typeof (globalThis as any).Worker !== "undefined",
+              hasSharedArrayBuffer: typeof (globalThis as any).SharedArrayBuffer !== "undefined",
+              userAgent: (globalThis as any).navigator?.userAgent ?? null,
+            },
+            importMeta: { available: typeof import.meta !== "undefined", url: importMetaUrl },
+          };
+          return new Response(JSON.stringify(body, null, 2), { status: 200, headers: { "content-type": "application/json; charset=utf-8" } });
+        } catch (e: any) {
+          return textResponse("probe error: " + (e?.stack || String(e)), 500);
+        }
+      }
+
+      if (pathname === "/__jsplus") {
+        try {
+          const mod = await import("../scripts/php_8_4.js");
+          const def = (mod as any)?.default ?? null;
+          const hasFactory = typeof def === "function";
+          const payload = { imported: true, hasDefaultFactory: hasFactory, exportKeys: Object.keys(mod || {}), note: "import-only, no init" };
+          return new Response(JSON.stringify(payload, null, 2), { status: 200, headers: { "content-type": "application/json; charset=utf-8" } });
+        } catch (e: any) {
+          return textResponse("Import glue failed:\n" + (e?.stack || String(e)), 500);
+        }
+      }
+
+      if (pathname === "/__mod") {
+        try {
+          const argv = buildArgvForCode("echo 'ok';");
+          const res = await createPhpModuleAndRun(argv);
+          const summary = res.ok
+            ? {
+                keys: res.php ? Object.keys(res.php) : [],
+                has: {
+                  callMain: typeof (res.php as any)?.callMain === "function",
+                  run: typeof (res.php as any)?.run === "function",
+                  ccall: typeof (res.php as any)?.ccall === "function",
+                  cwrap: typeof (res.php as any)?.cwrap === "function",
+                  _main: typeof (res.php as any)?._main === "function",
+                  FS: !!(res.php as any)?.FS,
+                },
+                calledRun: (res.php as any)?.calledRun ?? undefined,
+                exitStatus: res.exitStatus ?? undefined,
+                trace: res.debug,
+                stdoutSample: (res.stdout || []).slice(0, 2),
+                stderrSample: (res.stderr || []).slice(0, 2),
+              }
+            : { error: res.error, trace: res.debug, stderr: res.stderr.slice(0, 5) };
+          return new Response(JSON.stringify(summary, null, 2), { status: 200, headers: { "content-type": "application/json; charset=utf-8" } });
+        } catch (e: any) {
+          return textResponse("mod error: " + (e?.stack || String(e)), 500);
+        }
+      }
+
+      if (pathname === "/__net") {
+        return routeNet(url);
+      }
+
+      if (pathname === "/" || pathname === "/index.php" || pathname === "/info") {
+        return routeInfo(url);
+      }
+
+      if (pathname === "/public/index.php") {
+        return routeRepoIndex(url);
+      }
+
+      if (pathname === "/run" && request.method === "GET") {
+        return routeRunGET(url);
+      }
+      if (pathname === "/run" && request.method === "POST") {
+        return routeRunPOST(request, url);
+      }
+
+      if (pathname === "/version") return routeVersion();
+      if (pathname === "/help") return routeHelp();
+
+      return textResponse("Not Found", 404);
+    } catch (e: any) {
+      // Final guard against 1101: never throw out of fetch()
+      return textResponse("Top-level handler error: " + (e?.stack || String(e)), 500);
+    }
+  },
+};
