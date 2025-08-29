@@ -1,15 +1,12 @@
 // src/index.ts
 // wasmphp worker - KV first, GitHub fallback, auto-run (eval) mode
-// Minimal, cleaned, and runnable version based on your prior code.
+// Clean and runnable version
 
-import wasmAsset from "../scripts/php_8_4.wasm"; // must match your project file
-// note: glue loader is imported dynamically inside runAuto: ../scripts/php_8_4.js
+import wasmAsset from "../scripts/php_8_4.wasm"; // must exist in project
 
-// --- Types ---
 type Env = {
   SRC?: KVNamespace;
   ADMIN_TOKEN?: string;
-  // other env keys allowed
 };
 
 // --- Ensure minimal globals for Emscripten glue in Workers ---
@@ -25,7 +22,6 @@ type Env = {
   }
 })();
 
-// --- Defaults / helpers ---
 const DEFAULT_INIS = [
   "pcre.jit=0",
   "opcache.enable=0",
@@ -63,21 +59,9 @@ function buildArgvForCode(code: string, iniList: string[] = []): string[] {
 }
 
 function wrapCodeWithShutdownNewline(code: string): string {
-  // ensure there is a trailing newline printed to mark EOF
   return `register_shutdown_function(function(){echo "\\n";}); ${code}`;
 }
 
-function toBase64Utf8(s: string): string {
-  const bytes = new TextEncoder().encode(s);
-  let binary = "";
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
-  }
-  return btoa(binary);
-}
-
-// --- KV key normalization (防 double public) ---
 function kvKeyFromPath(pathname: string): string | null {
   let p = decodeURIComponent(pathname);
   if (p.endsWith("/")) p += "index.php";
@@ -89,7 +73,6 @@ function kvKeyFromPath(pathname: string): string | null {
   return key;
 }
 
-// --- normalize/clean php source for eval (strip <?php etc) ---
 function normalizePhpCodeForEval(src: string): string {
   let s = src.trimStart();
   if (s.charCodeAt(0) === 0xfeff) s = s.slice(1);
@@ -99,7 +82,6 @@ function normalizePhpCodeForEval(src: string): string {
   return s;
 }
 
-// --- build init options (handles wasmAsset types) ---
 function isWasmModule(x: any): x is WebAssembly.Module {
   return Object.prototype.toString.call(x) === "[object WebAssembly.Module]";
 }
@@ -113,7 +95,7 @@ function makeInstantiateWithModule(wasmModule: WebAssembly.Module) {
 
 async function buildInitOptions(base: Partial<any>) {
   const opts: any = {
-    noInitialRun: false, // auto-run
+    noInitialRun: false,
     print: () => {},
     printErr: () => {},
     onRuntimeInitialized: () => {},
@@ -124,43 +106,29 @@ async function buildInitOptions(base: Partial<any>) {
     ...base,
   };
 
-  // normalize wasmAsset into Uint8Array (most glue variants accept this reliably)
-  try {
   if (isWasmModule(wasmAsset)) {
-      // If compiled-in Module, use instantiate hook (no binary)
-    opts.instantiateWasm = makeInstantiateWithModule(wasmAsset as WebAssembly.Module);
+    opts.instantiateWasm = makeInstantiateWithModule(wasmAsset);
     return opts;
   }
   if (typeof wasmAsset === "string") {
     const res = await fetch(wasmAsset);
-    if (!res.ok) throw new Error(`Failed to fetch wasm from URL: ${res.status}`);
     const buf = await res.arrayBuffer();
-      opts.wasmBinary = new Uint8Array(buf);
+    opts.wasmBinary = new Uint8Array(buf);
     return opts;
   }
   if (wasmAsset instanceof ArrayBuffer) {
-      opts.wasmBinary = new Uint8Array(wasmAsset);
+    opts.wasmBinary = new Uint8Array(wasmAsset);
     return opts;
   }
-
   if (ArrayBuffer.isView(wasmAsset)) {
     const view = wasmAsset as ArrayBufferView;
-      // copy into a compact Uint8Array slice to avoid exposing larger backing buffers
-      opts.wasmBinary = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
-      // create a copy to be extra safe
-      opts.wasmBinary = new Uint8Array(opts.wasmBinary);
+    opts.wasmBinary = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
     return opts;
   }
-
-    // Last resort: leave to glue to fetch; return opts as-is
   return opts;
-  } catch (e) {
-    // If something unexpected happens, surface a clearer error
-    throw new Error("buildInitOptions error: " + (e?.message || String(e)));
-  }
 }
 
-// --- runAuto: import glue and init with argv (auto-run) ---
+// --- runAuto: import glue and init once ---
 async function runAuto(argv: string[], waitMs = 8000) {
   const debug: string[] = [];
   const stdout: string[] = [];
@@ -180,44 +148,43 @@ async function runAuto(argv: string[], waitMs = 8000) {
     moduleOptions.onRuntimeInitialized = () => { debug.push("auto:event:onRuntimeInitialized"); };
 
     debug.push("auto:init-factory");
-    await initCandidate(moduleOptions);  // ✅ 只用这一种调用
+    await initCandidate(moduleOptions);
 
-    // wait for output or exit marker
     const start = Date.now();
     while (Date.now() - start < waitMs) {
       if (typeof moduleOptions.__exitStatus === "number") {
         exitStatus = moduleOptions.__exitStatus;
         debug.push("auto:exit:" + String(exitStatus));
         break;
-        }
+      }
       if (stdout.length > 0) break;
       await new Promise((r) => setTimeout(r, 20));
-      }
+    }
 
     return { ok: true, stdout, stderr, debug, exitStatus };
-        } catch (e: any) {
+  } catch (e: any) {
     return { ok: false, stdout, stderr, debug: ["auto:catch-top", e?.message || String(e)], error: e?.stack || String(e) };
-        }
+  }
+}
+
+// --- Worker fetch ---
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    try {
+      const url = new URL(request.url);
+      const pathname = url.pathname;
+
+      if (pathname === "/run" && request.method === "GET") {
+        const code = url.searchParams.get("code") || "";
+        const iniList = parseIniParams(url);
+        const argv = buildArgvForCode(wrapCodeWithShutdownNewline(normalizePhpCodeForEval(code)), iniList);
+        const result = await runAuto(argv);
+        return textResponse(result.stdout.join("\n"));
       }
 
-      // KV diag/put
-      if (pathname === "/__kv") return routeKvDiag(url, env);
-      if (pathname === "/__put" && (request.method === "POST" || request.method === "PUT")) return routeKvPut(request, url, env);
+      if (pathname === "/version") return textResponse("wasmphp worker v1");
+      if (pathname === "/help") return textResponse("usage: /run?code=echo 123;");
 
-      // Root / index -> repo index (KV first)
-      if (pathname === "/" || pathname === "/index.php" || pathname === "/public/index.php") {
-        return routeRepoIndex(url, env);
-      }
-
-      // info / run / version / help
-      if (pathname === "/info") return routeInfo(url);
-      if (pathname === "/run" && request.method === "GET") return routeRunGET(url);
-      if (pathname === "/run" && request.method === "POST") return routeRunPOST(request, url);
-      if (pathname === "/version") return routeVersion();
-      if (pathname === "/help") return routeHelp();
-
-      // fallback: for any other path, try to treat it as request for a key; attempt to run code if `code` present
-      // For static resources we expect them served by other worker logic; here we respond 404.
       return textResponse("Not Found", 404);
     } catch (err: any) {
       return new Response("WASM PHP runtime error:\n" + (err?.stack || err), { status: 500 });
