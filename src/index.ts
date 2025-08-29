@@ -170,9 +170,19 @@ async function fetchKVPhpSource(env: Env, key: string): Promise<{ ok: boolean; c
 
 // --- Routes ---
 async function routeRepoIndex(url: URL, env: Env) {
-  const key = url.searchParams.get("key") || "public/index.php";
+  const keysToTry = [
+    "public/index.php",
+    "index.php",
+    "Static_Creation/public/index.php",
+  ];
+
   let codeNormalized: string | undefined;
-  if (env?.SRC) { const kv = await fetchKVPhpSource(env, key); if (kv.ok) codeNormalized = kv.code; }
+  if (env?.SRC) {
+    for (const k of keysToTry) {
+      const kv = await fetchKVPhpSource(env, k);
+      if (kv.ok) { codeNormalized = kv.code; break; }
+    }
+  }
   if (!codeNormalized) return textResponse("PHP source not found in KV", 404);
 
   const b64 = toBase64Utf8(codeNormalized || "");
