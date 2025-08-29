@@ -1,17 +1,9 @@
 // src/index.ts
-// wasmphp worker - minimal, Hono-free
-// Fully self-contained, avoids 1101 by using original wasm/js glue import
+import wasmAsset from "../scripts/php_8_4.wasm";
+import initWasm from "../scripts/php_8_4.js";
 
-import wasmAsset from "../scripts/php_8_4.wasm"; // must match your project file
-import initWasm from "../scripts/php_8_4.js";     // Emscripten glue JS
+type Env = { SRC?: KVNamespace; ADMIN_TOKEN?: string };
 
-// --- Types ---
-type Env = {
-  SRC?: KVNamespace;
-  ADMIN_TOKEN?: string;
-};
-
-// --- Defaults ---
 const DEFAULT_INIS = [
   "pcre.jit=0",
   "opcache.enable=0",
@@ -26,15 +18,13 @@ const DEFAULT_INIS = [
   "display_startup_errors=1",
 ];
 
-// --- helpers ---
 function textResponse(body: string, status = 200, headers: Record<string, string> = {}) {
   return new Response(body, { status, headers: { "content-type": "text/plain; charset=utf-8", ...headers } });
 }
 
 function parseIniParams(url: URL): string[] {
   const out: string[] = [];
-  const ds = url.searchParams.getAll("d").concat(url.searchParams.getAll("ini"));
-  for (const s of ds) {
+  for (const s of url.searchParams.getAll("d").concat(url.searchParams.getAll("ini"))) {
     const t = s.trim();
     if (t && t.includes("=")) out.push(t);
   }
@@ -49,12 +39,11 @@ function buildArgvForCode(code: string, iniList: string[] = []): string[] {
   return argv;
 }
 
-function wrapCodeWithShutdownNewline(code: string): string {
+function wrapCodeWithShutdownNewline(code: string) {
   return `register_shutdown_function(function(){echo "\\n";}); ${code}`;
 }
 
-// --- normalize PHP ---
-function normalizePhpCodeForEval(src: string): string {
+function normalizePhpCodeForEval(src: string) {
   let s = src.trimStart();
   if (s.charCodeAt(0) === 0xfeff) s = s.slice(1);
   if (s.startsWith("<?php")) s = s.slice(5);
@@ -63,44 +52,47 @@ function normalizePhpCodeForEval(src: string): string {
   return s;
 }
 
-// --- run PHP ---
+// --- run PHP with async wait ---
 async function runPhp(argv: string[], waitMs = 8000) {
   const stdout: string[] = [];
   const stderr: string[] = [];
 
-  const moduleOptions: any = {
-    arguments: argv,
-    print: (txt: string) => stdout.push(String(txt)),
-    printErr: (txt: string) => stderr.push(String(txt)),
-    noInitialRun: true,
-    wasmBinary: wasmAsset,
-    onRuntimeInitialized: () => {
-      try { (moduleOptions as any).callMain(argv); } catch(e) {}
-    },
-  };
+  return new Promise<any>(async (resolve) => {
+    const moduleOptions: any = {
+      arguments: argv,
+      print: (txt: string) => stdout.push(String(txt)),
+      printErr: (txt: string) => stderr.push(String(txt)),
+      noInitialRun: true,
+      wasmBinary: wasmAsset,
+      onRuntimeInitialized: () => {
+        try {
+          (moduleOptions as any).callMain(argv);
+        } catch (e) {
+          stderr.push("callMain error: " + (e as any).message);
+        }
+      },
+    };
 
-  let exitStatus: number | undefined;
+    try {
+      await initWasm(moduleOptions);
 
-  try {
-    await initWasm(moduleOptions);
-
-    const start = Date.now();
-    while (Date.now() - start < waitMs) {
-      if (typeof moduleOptions.__exitStatus === "number") {
-        exitStatus = moduleOptions.__exitStatus;
-        break;
-      }
-      await new Promise((r) => setTimeout(r, 20));
+      const start = Date.now();
+      const check = () => {
+        if (typeof moduleOptions.__exitStatus === "number" || Date.now() - start > waitMs) {
+          resolve({ ok: true, stdout, stderr, exitStatus: moduleOptions.__exitStatus });
+        } else {
+          setTimeout(check, 20);
+        }
+      };
+      check();
+    } catch (e: any) {
+      resolve({ ok: false, stdout, stderr, error: e?.message || String(e) });
     }
-
-    return { ok: true, stdout, stderr, exitStatus };
-  } catch (e: any) {
-    return { ok: false, stdout, stderr, error: e?.message || String(e) };
-  }
+  });
 }
 
 // --- KV / GitHub fetch ---
-async function fetchKVPhpSource(env: Env, key: string): Promise<{ ok: boolean; code?: string; err?: string }> {
+async function fetchKVPhpSource(env: Env, key: string) {
   try {
     if (!env?.SRC || typeof env.SRC.get !== "function") return { ok: false, err: "KV SRC not configured" };
     const txt = await env.SRC.get(key, "text");
