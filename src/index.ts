@@ -67,18 +67,23 @@ function normalizePhpCodeForEval(src: string): string {
 async function runPhp(argv: string[], waitMs = 8000) {
   const stdout: string[] = [];
   const stderr: string[] = [];
+
   const moduleOptions: any = {
     arguments: argv,
     print: (txt: string) => stdout.push(String(txt)),
     printErr: (txt: string) => stderr.push(String(txt)),
-    noInitialRun: false,
+    noInitialRun: true,
     wasmBinary: wasmAsset,
+    onRuntimeInitialized: () => {
+      try { (moduleOptions as any).callMain(argv); } catch(e) {}
+    },
   };
 
   let exitStatus: number | undefined;
 
   try {
-    const instance = await initWasm(moduleOptions);
+    await initWasm(moduleOptions);
+
     const start = Date.now();
     while (Date.now() - start < waitMs) {
       if (typeof moduleOptions.__exitStatus === "number") {
@@ -87,6 +92,7 @@ async function runPhp(argv: string[], waitMs = 8000) {
       }
       await new Promise((r) => setTimeout(r, 20));
     }
+
     return { ok: true, stdout, stderr, exitStatus };
   } catch (e: any) {
     return { ok: false, stdout, stderr, error: e?.message || String(e) };
