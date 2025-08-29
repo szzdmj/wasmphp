@@ -124,8 +124,10 @@ async function buildInitOptions(base: Partial<any>) {
     ...base,
   };
 
-  // wasmAsset may be a Module, URL string, ArrayBuffer, or TypedArray
+  // normalize wasmAsset into Uint8Array (most glue variants accept this reliably)
+  try {
   if (isWasmModule(wasmAsset)) {
+      // If compiled-in Module, use instantiate hook (no binary)
     opts.instantiateWasm = makeInstantiateWithModule(wasmAsset as WebAssembly.Module);
     return opts;
   }
@@ -133,20 +135,29 @@ async function buildInitOptions(base: Partial<any>) {
     const res = await fetch(wasmAsset);
     if (!res.ok) throw new Error(`Failed to fetch wasm from URL: ${res.status}`);
     const buf = await res.arrayBuffer();
-    opts.wasmBinary = buf;
+      opts.wasmBinary = new Uint8Array(buf);
     return opts;
   }
   if (wasmAsset instanceof ArrayBuffer) {
-    opts.wasmBinary = wasmAsset;
+      opts.wasmBinary = new Uint8Array(wasmAsset);
     return opts;
   }
+
   if (ArrayBuffer.isView(wasmAsset)) {
     const view = wasmAsset as ArrayBufferView;
-    opts.wasmBinary = view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength);
+      // copy into a compact Uint8Array slice to avoid exposing larger backing buffers
+      opts.wasmBinary = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+      // create a copy to be extra safe
+      opts.wasmBinary = new Uint8Array(opts.wasmBinary);
     return opts;
   }
-  // fallback: let glue handle fetching if possible
+
+    // Last resort: leave to glue to fetch; return opts as-is
   return opts;
+  } catch (e) {
+    // If something unexpected happens, surface a clearer error
+    throw new Error("buildInitOptions error: " + (e?.message || String(e)));
+  }
 }
 
 // --- runAuto: import glue and init with argv (auto-run) ---
@@ -169,19 +180,35 @@ async function runAuto(argv: string[], waitMs = 8000) {
     moduleOptions.onRuntimeInitialized = () => { debug.push("auto:event:onRuntimeInitialized"); };
 
     debug.push("auto:init-factory");
+    // We'll try a few invocation forms but do NOT let the first thrown error become the final noisy message.
+    const tries: Array<() => Promise<any>> = [
+      async () => { return await (initCandidate as any)(moduleOptions); },
+      async () => { return await (initCandidate as any)("WORKER", moduleOptions); },
+      async () => { return await (initCandidate as any)(moduleOptions, "WORKER"); },
+    ];
+
+    const errors: string[] = [];
+    let ok = false;
+    for (let i = 0; i < tries.length; i++) {
     try {
-      // try normal init
-      await (initCandidate as any)(moduleOptions);
-    } catch (e1: any) {
-      // some glue variants expect (env, options) or ("WORKER", options)
-      try {
-        await (initCandidate as any)("WORKER", moduleOptions);
-        debug.push("auto:factory:WORKER:ok");
-      } catch (e2: any) {
-        return { ok: false, stdout, stderr, debug, error: "autoRun factory failed: " + (e1?.message || e1) + " / " + (e2?.message || e2) };
+        await tries[i]();
+        debug.push(`auto:factory:try${i}:ok`);
+        ok = true;
+        break;
+      } catch (e: any) {
+        const msg = (e && e.message) ? e.message : String(e);
+        errors.push(`try${i} error: ${msg}`);
+        debug.push(`auto:factory:try${i}:err`);
+        // continue to next try
       }
     }
 
+    if (!ok) {
+      // return a single combined error (no longer a confusing first-try-only error)
+      return { ok: false, stdout, stderr, debug: debug.concat(errors), error: "autoRun factory failed: " + errors.join(" | ") };
+    }
+
+    // wait for output or exit marker
     const start = Date.now();
     while (Date.now() - start < waitMs) {
       if (typeof moduleOptions.__exitStatus === "number") { exitStatus = moduleOptions.__exitStatus; debug.push("auto:exit:" + String(exitStatus)); break; }
