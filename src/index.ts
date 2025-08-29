@@ -1,5 +1,8 @@
 // src/index.ts
-import wasmAsset from "../scripts/php_8_4.wasm";
+// wasmphp worker - KV first, GitHub fallback, auto-run (eval) mode
+// Fully self-contained, no local index.php import, Hono-free
+
+import wasmAsset from "../scripts/php_8_4.wasm"; // must match your project file
 
 // --- Types ---
 type Env = {
@@ -11,12 +14,12 @@ type Env = {
 (function ensureGlobals() {
   const g = globalThis as any;
   if (typeof g.location === "undefined") {
-    Object.defineProperty(g, "location", { value: { href: "file:///" }, configurable: true });
+    try { Object.defineProperty(g, "location", { value: { href: "file:///" }, configurable: true }); } catch {}
   }
   if (typeof g.self === "undefined") {
-    Object.defineProperty(g, "self", { value: g, configurable: true });
+    try { Object.defineProperty(g, "self", { value: g, configurable: true }); } catch {}
   } else if (typeof (g.self as any).location === "undefined") {
-    (g.self as any).location = g.location;
+    try { (g.self as any).location = g.location; } catch {}
   }
 })();
 
@@ -35,10 +38,10 @@ const DEFAULT_INIS = [
   "display_startup_errors=1",
 ];
 
-// --- Helpers ---
 function textResponse(body: string, status = 200, headers: Record<string, string> = {}) {
   return new Response(body, { status, headers: { "content-type": "text/plain; charset=utf-8", ...headers } });
 }
+
 function parseIniParams(url: URL): string[] {
   const out: string[] = [];
   const ds = url.searchParams.getAll("d").concat(url.searchParams.getAll("ini"));
@@ -48,6 +51,7 @@ function parseIniParams(url: URL): string[] {
   }
   return out;
 }
+
 function buildArgvForCode(code: string, iniList: string[] = []): string[] {
   const argv: string[] = [];
   for (const d of DEFAULT_INIS) argv.push("-d", d);
@@ -55,10 +59,12 @@ function buildArgvForCode(code: string, iniList: string[] = []): string[] {
   argv.push("-r", code);
   return argv;
 }
-function wrapCodeWithShutdownNewline(code: string) {
+
+function wrapCodeWithShutdownNewline(code: string): string {
   return `register_shutdown_function(function(){echo "\\n";}); ${code}`;
 }
-function toBase64Utf8(s: string) {
+
+function toBase64Utf8(s: string): string {
   const bytes = new TextEncoder().encode(s);
   let binary = "";
   const chunk = 0x8000;
@@ -67,6 +73,8 @@ function toBase64Utf8(s: string) {
   }
   return btoa(binary);
 }
+
+// --- normalize/clean php source for eval ---
 function normalizePhpCodeForEval(src: string): string {
   let s = src.trimStart();
   if (s.charCodeAt(0) === 0xfeff) s = s.slice(1);
@@ -75,18 +83,8 @@ function normalizePhpCodeForEval(src: string): string {
   s = s.replace(/\?>\s*$/s, "");
   return s;
 }
-function kvKeyFromPath(pathname: string): string | null {
-  let p = decodeURIComponent(pathname);
-  if (p.endsWith("/")) p += "index.php";
-  if (p === "/") p = "/index.php";
-  let key = p.replace(/^\/+/, "");
-  if (!key || key.includes("..")) return null;
-  if (!key.startsWith("public/")) key = "public/" + key;
-  key = key.replace(/^public\/public\//, "public/");
-  return key;
-}
 
-// --- WASM Init ---
+// --- build init options ---
 function isWasmModule(x: any): x is WebAssembly.Module {
   return Object.prototype.toString.call(x) === "[object WebAssembly.Module]";
 }
@@ -109,18 +107,27 @@ async function buildInitOptions(base: Partial<any>) {
     },
     ...base,
   };
+
   if (isWasmModule(wasmAsset)) {
     opts.instantiateWasm = makeInstantiateWithModule(wasmAsset as WebAssembly.Module);
     return opts;
   }
   if (typeof wasmAsset === "string") {
     const res = await fetch(wasmAsset);
-    if (!res.ok) throw new Error(`Failed to fetch wasm: ${res.status}`);
-    opts.wasmBinary = await res.arrayBuffer();
+    if (!res.ok) throw new Error(`Failed to fetch wasm from URL: ${res.status}`);
+    const buf = await res.arrayBuffer();
+    opts.wasmBinary = buf;
     return opts;
   }
-  if (wasmAsset instanceof ArrayBuffer) opts.wasmBinary = wasmAsset;
-  if (ArrayBuffer.isView(wasmAsset)) opts.wasmBinary = wasmAsset.buffer.slice(wasmAsset.byteOffset, wasmAsset.byteOffset + wasmAsset.byteLength);
+  if (wasmAsset instanceof ArrayBuffer) {
+    opts.wasmBinary = wasmAsset;
+    return opts;
+  }
+  if (ArrayBuffer.isView(wasmAsset)) {
+    const view = wasmAsset as ArrayBufferView;
+    opts.wasmBinary = view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength);
+    return opts;
+  }
   return opts;
 }
 
@@ -134,23 +141,32 @@ async function runAuto(argv: string[], waitMs = 8000) {
     debug.push("auto:import-glue");
     const phpModule = await import("../scripts/php_8_4.js");
     const initCandidate = (phpModule as any).init || (phpModule as any).default || (phpModule as any);
-    if (typeof initCandidate !== "function") return { ok: false, stdout, stderr, debug, error: "PHP init factory not found" };
+    if (typeof initCandidate !== "function") {
+      return { ok: false, stdout, stderr, debug, error: "PHP init factory not found" };
+    }
     debug.push("auto:build-options");
     const moduleOptions: any = await buildInitOptions({ arguments: argv.slice() });
     moduleOptions.print = (txt: string) => { try { stdout.push(String(txt)); } catch {} };
     moduleOptions.printErr = (txt: string) => { try { stderr.push(String(txt)); } catch {} };
-    moduleOptions.onRuntimeInitialized = () => { debug.push("auto:onRuntimeInitialized"); };
+    moduleOptions.onRuntimeInitialized = () => { debug.push("auto:event:onRuntimeInitialized"); };
 
     debug.push("auto:init-factory");
-    try { await (initCandidate as any)(moduleOptions); } 
-    catch (e1) { try { await (initCandidate as any)("WORKER", moduleOptions); debug.push("auto:factory:WORKER:ok"); } 
-    catch (e2) { return { ok: false, stdout, stderr, debug, error: "autoRun factory failed" }; } }
+    try {
+      await (initCandidate as any)(moduleOptions);
+    } catch (e1: any) {
+      try {
+        await (initCandidate as any)("WORKER", moduleOptions);
+        debug.push("auto:factory:WORKER:ok");
+      } catch (e2: any) {
+        return { ok: false, stdout, stderr, debug, error: "autoRun factory failed: " + (e1?.message || e1) + " / " + (e2?.message || e2) };
+      }
+    }
 
     const start = Date.now();
     while (Date.now() - start < waitMs) {
-      if (typeof moduleOptions.__exitStatus === "number") { exitStatus = moduleOptions.__exitStatus; debug.push("auto:exit:" + exitStatus); break; }
+      if (typeof moduleOptions.__exitStatus === "number") { exitStatus = moduleOptions.__exitStatus; debug.push("auto:exit:" + String(exitStatus)); break; }
       if (stdout.length > 0) break;
-      await new Promise(r => setTimeout(r, 20));
+      await new Promise((r) => setTimeout(r, 20));
     }
     return { ok: true, stdout, stderr, debug, exitStatus };
   } catch (e: any) {
@@ -158,32 +174,53 @@ async function runAuto(argv: string[], waitMs = 8000) {
   }
 }
 
-// --- KV fetch ---
+// --- KV / GitHub source fetch ---
 async function fetchKVPhpSource(env: Env, key: string): Promise<{ ok: boolean; code?: string; err?: string }> {
   try {
-    if (!env?.SRC || typeof env.SRC.get !== "function") return { ok: false, err: "KV not configured" };
+    if (!env || !env.SRC || typeof env.SRC.get !== "function") {
+      return { ok: false, err: "KV binding SRC is not configured" };
+    }
     const txt = await env.SRC.get(key, "text");
     if (txt == null) return { ok: false, err: `KV object not found: ${key}` };
     return { ok: true, code: normalizePhpCodeForEval(txt) };
-  } catch (e: any) { return { ok: false, err: e?.message || String(e) }; }
+  } catch (e: any) {
+    return { ok: false, err: "KV get failed: " + (e?.message || String(e)) };
+  }
 }
 
-// --- Routes ---
-async function routeRepoIndex(url: URL, env: Env) {
-  const keysToTry = [
-    "public/index.php",
-    "index.php",
-    "Static_Creation/public/index.php",
-  ];
+async function fetchGithubPhpSource(owner: string, repo: string, path: string, ref?: string): Promise<{ ok: boolean; code?: string; err?: string }> {
+  try {
+    const branch = (ref && ref.trim()) || "main";
+    const u = `https://raw.githubusercontent.com/${owner}/${repo}/${encodeURIComponent(branch)}/${path.replace(/^\/+/, "")}`;
+    const headers: Record<string, string> = {
+      "cache-control": "no-cache",
+      "user-agent": "wasmphp-worker",
+      "accept": "text/plain, */*",
+    };
+    let res = await fetch(u, { method: "GET", headers });
+    if (res.ok) {
+      const txt = await res.text();
+      return { ok: true, code: normalizePhpCodeForEval(txt) };
+    }
+    return { ok: false, err: `Raw fetch failed: ${owner}/${repo}:${branch}/${path} (${res.status})` };
+  } catch (e: any) {
+    return { ok: false, err: "Raw fetch threw: " + (e?.message || String(e)) };
+  }
+}
 
+// --- route helpers ---
+async function routeRepoIndex(url: URL, env: Env) {
+  const key = "public/index.php";
   let codeNormalized: string | undefined;
   if (env?.SRC) {
-    for (const k of keysToTry) {
-      const kv = await fetchKVPhpSource(env, k);
-      if (kv.ok) { codeNormalized = kv.code; break; }
-    }
+    const kv = await fetchKVPhpSource(env, key);
+    if (kv.ok) codeNormalized = kv.code;
   }
-  if (!codeNormalized) return textResponse("PHP source not found in KV", 404);
+  if (!codeNormalized) {
+    const gh = await fetchGithubPhpSource("szzdmj", "wasmphp", key);
+    if (!gh.ok) return textResponse(gh.err || "Fetch error", 502);
+    codeNormalized = gh.code;
+  }
 
   const b64 = toBase64Utf8(codeNormalized || "");
   const oneLiner = wrapCodeWithShutdownNewline(`eval(base64_decode('${b64}'));`);
@@ -196,35 +233,36 @@ async function routeRepoIndex(url: URL, env: Env) {
 async function routeRunGET(url: URL) {
   const codeRaw = url.searchParams.get("code") ?? "";
   if (!codeRaw) return textResponse("Bad Request: missing code", 400);
-  const argv = buildArgvForCode(wrapCodeWithShutdownNewline(codeRaw), parseIniParams(url));
-  const res = await runAuto(argv, 10000);
+  const ini = parseIniParams(url);
+  const argv = buildArgvForCode(wrapCodeWithShutdownNewline(codeRaw), ini);
+  const res = await runAuto(argv);
   return finalizeOk(url, res, "text/plain; charset=utf-8");
 }
 
-// --- finalize ---
-function finalizeOk(url: URL, res: any, defaultCT: string) {
-  const stdout = (res.stdout || []).join("\n");
-  const stderr = (res.stderr || []).join("\n");
-  const ct = stdout.includes("<html") ? "text/html; charset=utf-8" : defaultCT;
-  const body = stdout || stderr || `[wasmphp] no output, exitStatus=${res.exitStatus}`;
-  return new Response(body, { status: 200, headers: { "content-type": ct } });
-}
-
-// --- fetch handler ---
+// --- main fetch handler ---
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    try {
-      const url = new URL(request.url);
-      const pathname = url.pathname.replace(/\/+$/, "");
+    const url = new URL(request.url);
+    const { pathname } = url;
 
-      if (pathname === "/") return routeRepoIndex(url, env);
-      if (pathname === "/index.php") return routeRepoIndex(url, env);
-      if (pathname === "/run") return routeRunGET(url);
-      if (pathname === "/health") return textResponse("ok");
+    if (pathname === "/health") return textResponse("ok");
 
-      return textResponse("Not Found", 404);
-    } catch (e: any) {
-      return textResponse("WASM PHP runtime error:\n" + (e?.stack || e), 500);
+    if (pathname === "/__jsplus") {
+      try {
+        const mod = await import("../scripts/php_8_4.js");
+        const def = (mod as any)?.default ?? null;
+        const hasFactory = typeof def === "function";
+        const payload = { imported: true, hasDefaultFactory: hasFactory, exportKeys: Object.keys(mod || {}), note: "import-only, no init" };
+        return new Response(JSON.stringify(payload, null, 2), { status: 200, headers: { "content-type": "application/json; charset=utf-8" } });
+      } catch (e: any) {
+        return textResponse("Import glue failed:\n" + (e?.stack || String(e)), 500);
+      }
     }
-  }
+
+    if (pathname === "/run" && request.method === "GET") return routeRunGET(url);
+
+    if (pathname === "/" || pathname === "/index.php") return routeRepoIndex(url, env);
+
+    return textResponse("Not Found", 404);
+  },
 };
