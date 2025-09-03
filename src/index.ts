@@ -1,10 +1,10 @@
 // V66k + KV: 在 V66k 基础上增加 Workers KV 源码读取与可选上传接口。
-// - 保持 V66k 执行器：auto-run(noInitialRun=false) + -r + base64 eval + register_shutdown_function("\n")。
-// - 首页与 /public/index.php 从 KV 读取（key=public/index.php），失败时回退 GitHub Raw（可保留容灾）。
+// - 执行器切换为：noInitialRun=true + 手动调用 callMain(argv)（避免 Emscripten 对 Module.arguments 的写入导致只读字符串异常）。
+// - 保持 -r + base64 eval + register_shutdown_function("\n")。
+// - 首页与 /public/index.php 从 KV 读取（key=public/index.php），失败时回退 GitHub Raw（容灾）。
 // - 提供 /__kv 诊断与 /__put 上传（需 ADMIN_TOKEN Secret）。
-// - 仍然不依赖 FS（/__mod 显示 FS:false），因此多文件建议“Bundle 模式”或 manifest 组装。
 // - 兼容打包顶层有或没有 public/ 目录：KV 和 GitHub 回退都会尝试 public/index.php 与 index.php 等变体。
-// - 防御 Emscripten Module.arguments 非数组导致的 "Cannot assign to read only property '0'..."。
+// - 额外防御：强制 Module.arguments 为数组，且默认置空，彻底规避 "Cannot assign to read only property '0' of object '[object String]'"。
 
 import wasmAsset from "../scripts/php_8_4.wasm";
 
@@ -85,7 +85,8 @@ function ensureArgvArray(x: any): string[] {
 
 async function buildInitOptions(base: Partial<any>) {
   const opts: any = {
-    noInitialRun: false, // auto-run
+    // 关键：禁用自动运行，改为手动 callMain(argv)
+    noInitialRun: true,
     print: () => {},
     printErr: () => {},
     onRuntimeInitialized: () => {},
@@ -96,10 +97,9 @@ async function buildInitOptions(base: Partial<any>) {
     ...base,
   };
 
-  // 关键修复：Emscripten glue 会写 argv[0]，若 arguments 被传成字符串会抛错
-  if ("arguments" in opts) {
-    opts.arguments = ensureArgvArray((opts as any).arguments);
-  }
+  // 强制把 arguments 规范成“可写的数组”，并默认置空
+  // （后续我们用 callMain(argv) 传入参数，避免 glue 操作 Module.arguments）
+  opts.arguments = [];
 
   if (isWasmModule(wasmAsset)) {
     opts.instantiateWasm = makeInstantiateWithModule(wasmAsset as WebAssembly.Module);
@@ -124,7 +124,7 @@ async function buildInitOptions(base: Partial<any>) {
   throw new Error("Unsupported wasm asset type at runtime");
 }
 
-// Auto-run runner. Arguments MUST NOT contain a fake program name.
+// Auto-run runner via manual callMain. Arguments MUST NOT contain a fake program name.
 async function runAuto(argv: string[], waitMs = 8000): Promise<RunResult> {
   const debug: string[] = [];
   const stdout: string[] = [];
@@ -137,19 +137,43 @@ async function runAuto(argv: string[], waitMs = 8000): Promise<RunResult> {
     if (typeof initCandidate !== "function") {
       return { ok: false, stdout, stderr, debug, error: "PHP init factory not found" };
     }
+
     debug.push("auto:build-options");
-    const moduleOptions: any = await buildInitOptions({ arguments: argv.slice() });
+    const moduleOptions: any = await buildInitOptions({});
     moduleOptions.print = (txt: string) => { try { stdout.push(String(txt)); } catch {} };
     moduleOptions.printErr = (txt: string) => { try { stderr.push(String(txt)); } catch {} };
     moduleOptions.onRuntimeInitialized = () => { debug.push("auto:event:onRuntimeInitialized"); };
 
     debug.push("auto:init-factory");
-    try { await (initCandidate as any)(moduleOptions); } catch (e1: any) {
-      try { await (initCandidate as any)("WORKER", moduleOptions); debug.push("auto:factory:WORKER:ok"); } catch (e2: any) {
+    let moduleObj: any | null = null;
+    try {
+      moduleObj = await (initCandidate as any)(moduleOptions);
+      debug.push("auto:factory:ok");
+    } catch (e1: any) {
+      try {
+        moduleObj = await (initCandidate as any)("WORKER", moduleOptions);
+        debug.push("auto:factory:WORKER:ok");
+      } catch (e2: any) {
         return { ok: false, stdout, stderr, debug, error: "autoRun factory failed: " + (e1?.message || e1) + " / " + (e2?.message || e2) };
       }
     }
 
+    // 手动调用 callMain，避免使用 Module.arguments
+    if (!moduleObj || typeof moduleObj.callMain !== "function") {
+      return { ok: false, stdout, stderr, debug, error: "Module.callMain is not available" };
+    }
+
+    // 运行
+    try {
+      debug.push("auto:callMain:start");
+      moduleObj.callMain(Array.isArray(argv) ? argv.slice() : ensureArgvArray(argv));
+      debug.push("auto:callMain:return");
+    } catch (e: any) {
+      // Emscripten 退出或异常
+      debug.push("auto:callMain:threw:" + (e?.message || String(e)));
+    }
+
+    // 等待输出或退出
     const start = Date.now();
     while (Date.now() - start < waitMs) {
       if (typeof moduleOptions.__exitStatus === "number") { exitStatus = moduleOptions.__exitStatus; debug.push("auto:exit:" + String(exitStatus)); break; }
