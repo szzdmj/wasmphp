@@ -1,9 +1,10 @@
 // V66k + KV: 在 V66k 基础上增加 Workers KV 源码读取与可选上传接口。
-// - 保持 auto-run(noInitialRun=false) 工厂初始化；/run 仍走 -r，短代码稳定。
-// - 首页与 /public/index.php：优先从 KV 读取（兼容是否带 public/ 前缀），失败回退 GitHub Raw；改为“preRun 写入 MEMFS + 以文件路径作为 argv”执行，避免 -r 传大代码导致的 OOB。
-// - preRun 改为使用 Module.FS（而非 global FS），并写入相对路径 "__wasmphp__/index.php"，修复 “Could not open input file”。
-// - 防御 Emscripten Module.arguments 非数组导致的 "Cannot assign to read only property '0'..."。
-// - 增加 Source 追踪：响应头 x-wasmphp-source 标记使用的来源（kv:xxx 或 gh:xxx）。
+// - / 主页：优先从 KV 读取 index.php（兼容是否带 public/ 前缀），失败回退 GitHub Raw；采用“preRun 写入 MEMFS + 以文件路径作为 argv”执行，避免 -r 传大代码导致的 OOB。
+// - /run 仍走 -r（短代码）；/info 或 ?phpinfo=1 可直接跑 phpinfo 校验运行时。
+// - 新增 ?sample=1：不读 KV/GitHub，直接写入内置演示 index.php 到 MEMFS 执行，快速验证“写文件 + 执行文件”链路。
+// - /__kv 诊断 + /__put 上传（需 ADMIN_TOKEN Secret）。
+// - 防御：Emscripten Module.arguments 强制为字符串数组，避免 "Cannot assign to read only property '0' of object '[object String]'"。
+// - 响应头 x-wasmphp-source 指示使用来源（kv:/gh:/sample:/phpinfo）。
 
 import wasmAsset from "../scripts/php_8_4.wasm";
 
@@ -134,8 +135,33 @@ function toUint8(s: string): Uint8Array {
   return new TextEncoder().encode(s);
 }
 
-// Auto-run runner，支持可选 preRun(Module) 钩子（用于先写入 MEMFS）
-async function runAuto(argv: string[], waitMs = 8000, preRun?: Array<(Module: any) => void>): Promise<RunResult> {
+// 写 MEMFS 的 preRun 编排（使用 moduleOptions.FS，确保在 main 之前执行）
+type WriteFileSpec = { path: string; data: Uint8Array };
+function makePreRunForFiles(moduleOptions: any, files: WriteFileSpec[]): () => void {
+  return () => {
+    const FS = moduleOptions?.FS;
+    if (!FS) return;
+    const mkdirp = (p: string) => {
+      const parts = p.split("/").filter(Boolean);
+      let cur = "";
+      for (let i = 0; i < parts.length; i++) {
+        cur += "/" + parts[i];
+        try { FS.mkdir(cur); } catch {}
+      }
+    };
+    for (const f of files) {
+      try {
+        const dir = f.path.slice(0, f.path.lastIndexOf("/")) || "/";
+        if (dir && dir !== "/") mkdirp(dir);
+        try { FS.unlink(f.path); } catch {}
+        FS.writeFile(f.path, f.data);
+      } catch {}
+    }
+  };
+}
+
+// Auto-run runner，支持写入 MEMFS 的 preRunFiles
+async function runAuto(argv: string[], waitMs = 8000, preRunFiles?: WriteFileSpec[]): Promise<RunResult> {
   const debug: string[] = [];
   const stdout: string[] = [];
   const stderr: string[] = [];
@@ -153,9 +179,11 @@ async function runAuto(argv: string[], waitMs = 8000, preRun?: Array<(Module: an
     moduleOptions.printErr = (txt: string) => { try { stderr.push(String(txt)); } catch {} };
     moduleOptions.onRuntimeInitialized = () => { debug.push("auto:event:onRuntimeInitialized"); };
 
-    if (preRun && preRun.length) {
+    if (preRunFiles && preRunFiles.length) {
       const prev = Array.isArray(moduleOptions.preRun) ? moduleOptions.preRun : (moduleOptions.preRun ? [moduleOptions.preRun] : []);
-      moduleOptions.preRun = prev.concat(preRun);
+      // 注意：这里闭包引用 moduleOptions，确保可访问到 moduleOptions.FS
+      const writer = makePreRunForFiles(moduleOptions, preRunFiles);
+      moduleOptions.preRun = prev.concat([writer]);
     }
 
     debug.push("auto:init-factory");
@@ -321,6 +349,7 @@ async function fetchGithubPhpSource(owner: string, repo: string, path: string, r
     return { ok: false, err: "Raw fetch threw: " + (e?.message || String(e)) };
   }
 }
+
 function toBase64Utf8(s: string): string {
   const bytes = new TextEncoder().encode(s);
   let binary = "";
@@ -386,10 +415,34 @@ async function routeRunPOST(request: Request, url: URL): Promise<Response> {
 // 兼容 KV key 结构（带/不带 public 前缀）并支持 GitHub 回退；首页走“写文件 + 文件执行”避免 -r 过长
 async function routeRepoIndex(url: URL, env: any): Promise<Response> {
   try {
+    // 方法二：开关显示 phpinfo，快速验证运行时（无需任何外源代码）
+    if (url.searchParams.get("phpinfo") === "1") {
+      const argv = buildArgvForCode("phpinfo();");
+      const res = await runAuto(argv, 12000);
+      const out = finalizeOk(url, res, "text/html; charset=utf-8", { "x-wasmphp-source": "phpinfo" });
+      return out;
+    }
+
     const ref = url.searchParams.get("ref") || undefined;
     const mode = url.searchParams.get("mode") || "";
     const preferredKeyParam = url.searchParams.get("key");
     const candidates = buildKeyCandidates(preferredKeyParam ?? "public/index.php");
+
+    // 方法一（调试）：直接写入一个内置 sample index.php 到 MEMFS 执行
+    if (url.searchParams.get("sample") === "1") {
+      const demo = [
+        "<?php",
+        "echo \"<h1>wasmphp sample OK</h1>\\n\";",
+        "echo \"PHP Version: \".PHP_VERSION.\"\\n\";",
+        "if (isset($_GET['i']) && $_GET['i']==='1') { phpinfo(); }",
+        "?>"
+      ].join("\n");
+      const pathAbs = "/__wasmphp__/index.php";
+      const argv = buildArgvForFile("__wasmphp__/index.php", parseIniParams(url));
+      const res = await runAuto(argv, 12000, [{ path: pathAbs, data: toUint8(demo) }]);
+      const out = finalizeOk(url, res, "text/html; charset=utf-8", { "x-wasmphp-source": "sample" });
+      return out;
+    }
 
     // 1) 优先从 KV 读（尝试多个候选 key）
     let codeNormalized: string | undefined;
@@ -422,22 +475,14 @@ async function routeRepoIndex(url: URL, env: any): Promise<Response> {
       return new Response(codeNormalized!, { status: 200, headers: { "content-type": "text/plain; charset=utf-8", "x-wasmphp-source": sourceTag } });
     }
 
-    // preRun：用 Module.FS 写入相对路径，避免绝对路径解析差异
-    const relScriptPath = "__wasmphp__/index.php";
-    const preRun: Array<(Module: any) => void> = [
-      (Module: any) => {
-        const FS = Module?.FS;
-        if (!FS) return;
-        try { FS.mkdir("/__wasmphp__"); } catch {}
-        try { FS.unlink("/__wasmphp__/index.php"); } catch {}
-        const code = wrapCodeWithShutdownNewline(codeNormalized!);
-        FS.writeFile("/__wasmphp__/index.php", toUint8(code));
-      }
-    ];
-
+    // 写入 MEMFS 并以“文件路径”执行，避免 -r 大字符串
+    const scriptAbs = "/__wasmphp__/index.php";
+    const scriptRel = "__wasmphp__/index.php";
     const ini = parseIniParams(url);
-    const argv = buildArgvForFile(relScriptPath, ini); // 传相对路径
-    const res = await runAuto(argv, 12000, preRun);
+    const argv = buildArgvForFile(scriptRel, ini);
+    const codeWrapped = wrapCodeWithShutdownNewline(codeNormalized!);
+    const res = await runAuto(argv, 15000, [{ path: scriptAbs, data: toUint8(codeWrapped) }]);
+
     const out = res.ok
       ? finalizeOk(url, res, "text/html; charset=utf-8", { "x-wasmphp-source": sourceTag || "unknown" })
       : textResponse((res.stderr.join("\n") || "") + (res.error ? ("\n" + res.error) : "") + "\ntrace: " + res.debug.join("->"), 500);
@@ -561,7 +606,7 @@ export default {
         return routeKvPut(request, url, env);
       }
 
-      // Home: render KV's /public/index.php (fallback GitHub)
+      // Home: render KV's /public/index.php (fallback GitHub) 或 phpinfo/sample 快捷调试
       if (pathname === "/" || pathname === "/index.php" || pathname === "/public/index.php") {
         return routeRepoIndex(url, env);
       }
