@@ -1,8 +1,6 @@
 // V66k + KV: 在 V66k 基础上增加 Workers KV 源码读取与可选上传接口。
-// - 保持 V66k 执行器：auto-run(noInitialRun=false) + -r + base64 eval + register_shutdown_function("\n")。
-// - 首页与 /public/index.php 从 KV 读取（key=public/index.php），失败时回退 GitHub Raw（可保留容灾）。
-// - 提供 /__kv 诊断与 /__put 上传（需 ADMIN_TOKEN Secret）。
-// - 兼容打包顶层有或没有 public/ 目录：KV 和 GitHub 回退都会尝试 public/index.php 与 index.php 等变体。
+// - 保持 auto-run(noInitialRun=false) 工厂初始化；为避免“大代码通过 -r 作为 argv”引发的内存越界，首页执行改为“preRun 写入 MEMFS + 以文件路径作为 argv”。
+// - /run 仍然走 -r（短代码），/ 首页与 /public/index.php 走“写文件 + 执行文件”路径，兼容打包顶层是否包含 public/。
 // - 防御 Emscripten Module.arguments 非数组导致的 "Cannot assign to read only property '0'..."。
 
 import wasmAsset from "../scripts/php_8_4.wasm";
@@ -73,6 +71,14 @@ function buildArgvForCode(code: string, iniList: string[] = []): string[] {
   argv.push("-r", code);
   return argv;
 }
+function buildArgvForFile(filePath: string, iniList: string[] = []): string[] {
+  const argv: string[] = [];
+  for (const d of DEFAULT_INIS) argv.push("-d", d);
+  for (const d of iniList) if (d) argv.push("-d", d);
+  // 直接以脚本文件路径作为最后一个参数，PHP CLI 会执行该文件
+  argv.push(filePath);
+  return argv;
+}
 
 // 防御性：确保传给 Emscripten 的 arguments 一定是字符串数组
 function ensureArgvArray(x: any): string[] {
@@ -123,8 +129,12 @@ async function buildInitOptions(base: Partial<any>) {
   throw new Error("Unsupported wasm asset type at runtime");
 }
 
-// Auto-run runner. Arguments MUST NOT contain a fake program name.
-async function runAuto(argv: string[], waitMs = 8000): Promise<RunResult> {
+function toUint8(s: string): Uint8Array {
+  return new TextEncoder().encode(s);
+}
+
+// Auto-run runner，支持可选 preRun 钩子（用于先写入 MEMFS）
+async function runAuto(argv: string[], waitMs = 8000, preRun?: Array<() => void>): Promise<RunResult> {
   const debug: string[] = [];
   const stdout: string[] = [];
   const stderr: string[] = [];
@@ -142,9 +152,20 @@ async function runAuto(argv: string[], waitMs = 8000): Promise<RunResult> {
     moduleOptions.printErr = (txt: string) => { try { stderr.push(String(txt)); } catch {} };
     moduleOptions.onRuntimeInitialized = () => { debug.push("auto:event:onRuntimeInitialized"); };
 
+    if (preRun && preRun.length) {
+      const prev = Array.isArray(moduleOptions.preRun) ? moduleOptions.preRun : (moduleOptions.preRun ? [moduleOptions.preRun] : []);
+      moduleOptions.preRun = prev.concat(preRun);
+    }
+
     debug.push("auto:init-factory");
-    try { await (initCandidate as any)(moduleOptions); debug.push("auto:factory:ok"); } catch (e1: any) {
-      try { await (initCandidate as any)("WORKER", moduleOptions); debug.push("auto:factory:WORKER:ok"); } catch (e2: any) {
+    try {
+      await (initCandidate as any)(moduleOptions);
+      debug.push("auto:factory:ok");
+    } catch (e1: any) {
+      try {
+        await (initCandidate as any)("WORKER", moduleOptions);
+        debug.push("auto:factory:WORKER:ok");
+      } catch (e2: any) {
         return { ok: false, stdout, stderr, debug, error: "autoRun factory failed: " + (e1?.message || e1) + " / " + (e2?.message || e2) };
       }
     }
@@ -398,11 +419,20 @@ async function routeRepoIndex(url: URL, env: any): Promise<Response> {
       return new Response(codeNormalized!, { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
     }
 
-    const b64 = toBase64Utf8(codeNormalized || "");
-    const oneLiner = wrapCodeWithShutdownNewline(`eval(base64_decode('${b64}'));`);
+    // 关键改动：使用 MEMFS 写入脚本文件，避免把大代码放进 argv 导致初始化 OOB
+    const scriptPath = "/__wasmphp__/index.php";
+    const preRun: Array<() => void> = [() => {
+      const FS = (globalThis as any).FS;
+      if (!FS) return;
+      try { FS.mkdir("/__wasmphp__"); } catch {}
+      try { FS.unlink(scriptPath); } catch {}
+      const code = wrapCodeWithShutdownNewline(codeNormalized!);
+      FS.writeFile(scriptPath, toUint8(code));
+    }];
+
     const ini = parseIniParams(url);
-    const argv = buildArgvForCode(oneLiner, ini);
-    const res = await runAuto(argv, 10000);
+    const argv = buildArgvForFile(scriptPath, ini);
+    const res = await runAuto(argv, 12000, preRun);
     if (!res.ok) {
       const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
       return textResponse(body, 500);
