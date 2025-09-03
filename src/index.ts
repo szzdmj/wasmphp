@@ -3,6 +3,8 @@
 // - 首页与 /public/index.php 从 KV 读取（key=public/index.php），失败时回退 GitHub Raw（可保留容灾）。
 // - 提供 /__kv 诊断与 /__put 上传（需 ADMIN_TOKEN Secret）。
 // - 仍然不依赖 FS（/__mod 显示 FS:false），因此多文件建议“Bundle 模式”或 manifest 组装。
+// - 兼容打包顶层有或没有 public/ 目录：KV 和 GitHub 回退都会尝试 public/index.php 与 index.php 等变体。
+// - 防御 Emscripten Module.arguments 非数组导致的 "Cannot assign to read only property '0'..."。
 
 import wasmAsset from "../scripts/php_8_4.wasm";
 
@@ -72,6 +74,15 @@ function buildArgvForCode(code: string, iniList: string[] = []): string[] {
   argv.push("-r", code);
   return argv;
 }
+
+// 防御性：确保传给 Emscripten 的 arguments 一定是字符串数组
+function ensureArgvArray(x: any): string[] {
+  if (Array.isArray(x)) return x.slice();
+  if (x == null) return [];
+  if (typeof x === "string") return [x];
+  try { return Array.from(x as any).map(String); } catch { return [String(x)]; }
+}
+
 async function buildInitOptions(base: Partial<any>) {
   const opts: any = {
     noInitialRun: false, // auto-run
@@ -84,6 +95,11 @@ async function buildInitOptions(base: Partial<any>) {
     },
     ...base,
   };
+
+  // 关键修复：Emscripten glue 会写 argv[0]，若 arguments 被传成字符串会抛错
+  if ("arguments" in opts) {
+    opts.arguments = ensureArgvArray((opts as any).arguments);
+  }
 
   if (isWasmModule(wasmAsset)) {
     opts.instantiateWasm = makeInstantiateWithModule(wasmAsset as WebAssembly.Module);
@@ -204,6 +220,30 @@ function normalizePhpCodeForEval(src: string): string {
   s = s.replace(/\?>\s*$/s, "");
   return s;
 }
+
+// 根据 preferKey 生成候选 key，兼容是否包含 public/ 前缀
+function buildKeyCandidates(preferKey?: string | null): string[] {
+  const candidates: string[] = [];
+  const add = (k: string) => {
+    const kk = k.replace(/^\/+/, ""); // 去掉开头的 /
+    if (!candidates.includes(kk)) candidates.push(kk);
+  };
+
+  if (preferKey && preferKey.trim()) {
+    const base = preferKey.replace(/^\/+/, "");
+    add(base);
+    if (base.startsWith("public/")) {
+      add(base.slice("public/".length));
+    } else {
+      add("public/" + base);
+    }
+  } else {
+    add("public/index.php");
+    add("index.php");
+  }
+  return candidates;
+}
+
 async function fetchKVPhpSource(env: any, key: string): Promise<{ ok: boolean; code?: string; err?: string }> {
   try {
     if (!env || !env.SRC || typeof env.SRC.get !== "function") {
@@ -216,6 +256,25 @@ async function fetchKVPhpSource(env: any, key: string): Promise<{ ok: boolean; c
     return { ok: false, err: "KV get failed: " + (e?.message || String(e)) };
   }
 }
+
+async function fetchKVFirstAvailable(env: any, keys: string[]): Promise<{ ok: boolean; code?: string; usedKey?: string; err?: string }> {
+  if (!env || !env.SRC || typeof env.SRC.get !== "function") {
+    return { ok: false, err: "KV binding SRC is not configured" };
+  }
+  let lastErr = "";
+  for (const k of keys) {
+    try {
+      const txt = await env.SRC.get(k, "text");
+      if (txt != null) {
+        return { ok: true, code: normalizePhpCodeForEval(txt), usedKey: k };
+      }
+    } catch (e: any) {
+      lastErr = e?.message || String(e);
+    }
+  }
+  return { ok: false, err: lastErr || `KV objects not found: ${keys.join(", ")}` };
+}
+
 async function fetchGithubPhpSource(owner: string, repo: string, path: string, ref?: string): Promise<{ ok: boolean; code?: string; err?: string; status?: number }> {
   try {
     const branch = (ref && ref.trim()) || "main";
@@ -243,6 +302,7 @@ async function fetchGithubPhpSource(owner: string, repo: string, path: string, r
     return { ok: false, err: "Raw fetch threw: " + (e?.message || String(e)) };
   }
 }
+
 function toBase64Utf8(s: string): string {
   const bytes = new TextEncoder().encode(s);
   let binary = "";
@@ -304,31 +364,39 @@ async function routeRunPOST(request: Request, url: URL): Promise<Response> {
     return textResponse("routeRunPOST error: " + (e?.stack || String(e)), 500);
   }
 }
+
+// 兼容 KV key 结构（带/不带 public 前缀）并支持 GitHub 回退
 async function routeRepoIndex(url: URL, env: any): Promise<Response> {
   try {
     const ref = url.searchParams.get("ref") || undefined;
     const mode = url.searchParams.get("mode") || "";
-    const key = url.searchParams.get("key") || "public/index.php";
+    const preferredKeyParam = url.searchParams.get("key");
+    const candidates = buildKeyCandidates(preferredKeyParam ?? "public/index.php");
 
-    // 1) 优先从 KV 读
+    // 1) 优先从 KV 读（尝试多个候选 key）
     let codeNormalized: string | undefined;
     if (env && env.SRC) {
-      const kv = await fetchKVPhpSource(env, key);
+      const kv = await fetchKVFirstAvailable(env, candidates);
       if (kv.ok) codeNormalized = kv.code!;
     }
 
-    // 2) KV 没拿到则回退 GitHub（容灾）
+    // 2) KV 没拿到则回退 GitHub（容灾），同样尝试候选路径
     if (!codeNormalized) {
-      const pull = await fetchGithubPhpSource("szzdmj", "wasmphp", key, ref);
-      if (!pull.ok) return textResponse(pull.err || "Fetch error", 502);
-      codeNormalized = pull.code || "";
-      if (mode === "raw") {
-        return new Response(codeNormalized, { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+      let ghErr = "";
+      for (const path of candidates) {
+        const pull = await fetchGithubPhpSource("szzdmj", "wasmphp", path, ref);
+        if (pull.ok) {
+          codeNormalized = pull.code || "";
+          break;
+        } else {
+          ghErr = pull.err || ghErr;
+        }
       }
-    } else {
-      if (mode === "raw") {
-        return new Response(codeNormalized, { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
-      }
+      if (!codeNormalized) return textResponse(ghErr || "Fetch error", 502);
+    }
+
+    if (mode === "raw") {
+      return new Response(codeNormalized!, { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
     }
 
     const b64 = toBase64Utf8(codeNormalized || "");
@@ -345,6 +413,7 @@ async function routeRepoIndex(url: URL, env: any): Promise<Response> {
     return textResponse("routeRepoIndex error: " + (e?.stack || String(e)), 500);
   }
 }
+
 async function routeVersion(): Promise<Response> {
   try {
     const argv: string[] = [];
@@ -373,9 +442,17 @@ async function routeHelp(): Promise<Response> {
 // —— KV 诊断与受保护上传 —— //
 async function routeKvDiag(url: URL, env: any): Promise<Response> {
   try {
-    const key = url.searchParams.get("key") || "public/index.php";
-    const r = await fetchKVPhpSource(env, key);
-    return new Response(JSON.stringify(r, null, 2), { status: r.ok ? 200 : 502, headers: { "content-type": "application/json; charset=utf-8" } });
+    const preferredKeyParam = url.searchParams.get("key");
+    const tryAll = url.searchParams.get("try") === "1";
+    if (!tryAll) {
+      const key = preferredKeyParam || "public/index.php";
+      const r = await fetchKVPhpSource(env, key);
+      return new Response(JSON.stringify(r, null, 2), { status: r.ok ? 200 : 502, headers: { "content-type": "application/json; charset=utf-8" } });
+    } else {
+      const candidates = buildKeyCandidates(preferredKeyParam ?? "public/index.php");
+      const found = await fetchKVFirstAvailable(env, candidates);
+      return new Response(JSON.stringify({ candidates, result: found }, null, 2), { status: found.ok ? 200 : 502, headers: { "content-type": "application/json; charset=utf-8" } });
+    }
   } catch (e: any) {
     return textResponse("kv diag error: " + (e?.stack || String(e)), 500);
   }
@@ -391,7 +468,7 @@ async function routeKvPut(request: Request, url: URL, env: any): Promise<Respons
     const token = request.headers.get("x-admin-token") || request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
     if (!admin || token !== admin) return textResponse("Unauthorized", 401);
 
-    const key = url.searchParams.get("key") || "";
+    const key = (url.searchParams.get("key") || "").replace(/^\/+/, "");
     if (badKey(key)) return textResponse("Bad key", 400);
 
     const body = await request.text();
