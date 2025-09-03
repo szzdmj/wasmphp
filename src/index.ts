@@ -1,7 +1,7 @@
 // V66k + KV: 在 V66k 基础上增加 Workers KV 源码读取与可选上传接口。
-// - 保持 auto-run(noInitialRun=false) 工厂初始化 + -r + base64 eval + register_shutdown_function("\n")。
-// - 首页与 /public/index.php：优先从 KV 读取（兼容是否带 public/ 前缀），失败回退 GitHub Raw；采用 -r eval，不再依赖 MEMFS 文件写入。
-// - 提供 /__kv 诊断与 /__put 上传（需 ADMIN_TOKEN Secret）。
+// - 保持 auto-run(noInitialRun=false) 工厂初始化；/run 仍走 -r，短代码稳定。
+// - 首页与 /public/index.php：优先从 KV 读取（兼容是否带 public/ 前缀），失败回退 GitHub Raw；改为“preRun 写入 MEMFS + 以文件路径作为 argv”执行，避免 -r 传大代码导致的 OOB。
+// - preRun 改为使用 Module.FS（而非 global FS），并写入相对路径 "__wasmphp__/index.php"，修复 “Could not open input file”。
 // - 防御 Emscripten Module.arguments 非数组导致的 "Cannot assign to read only property '0'..."。
 // - 增加 Source 追踪：响应头 x-wasmphp-source 标记使用的来源（kv:xxx 或 gh:xxx）。
 
@@ -73,6 +73,13 @@ function buildArgvForCode(code: string, iniList: string[] = []): string[] {
   argv.push("-r", code);
   return argv;
 }
+function buildArgvForFile(filePath: string, iniList: string[] = []): string[] {
+  const argv: string[] = [];
+  for (const d of DEFAULT_INIS) argv.push("-d", d);
+  for (const d of iniList) if (d) argv.push("-d", d);
+  argv.push(filePath);
+  return argv;
+}
 
 // 防御性：确保传给 Emscripten 的 arguments 一定是字符串数组
 function ensureArgvArray(x: any): string[] {
@@ -123,8 +130,12 @@ async function buildInitOptions(base: Partial<any>) {
   throw new Error("Unsupported wasm asset type at runtime");
 }
 
-// Auto-run runner. Arguments MUST NOT contain a fake program name.
-async function runAuto(argv: string[], waitMs = 8000): Promise<RunResult> {
+function toUint8(s: string): Uint8Array {
+  return new TextEncoder().encode(s);
+}
+
+// Auto-run runner，支持可选 preRun(Module) 钩子（用于先写入 MEMFS）
+async function runAuto(argv: string[], waitMs = 8000, preRun?: Array<(Module: any) => void>): Promise<RunResult> {
   const debug: string[] = [];
   const stdout: string[] = [];
   const stderr: string[] = [];
@@ -142,9 +153,20 @@ async function runAuto(argv: string[], waitMs = 8000): Promise<RunResult> {
     moduleOptions.printErr = (txt: string) => { try { stderr.push(String(txt)); } catch {} };
     moduleOptions.onRuntimeInitialized = () => { debug.push("auto:event:onRuntimeInitialized"); };
 
+    if (preRun && preRun.length) {
+      const prev = Array.isArray(moduleOptions.preRun) ? moduleOptions.preRun : (moduleOptions.preRun ? [moduleOptions.preRun] : []);
+      moduleOptions.preRun = prev.concat(preRun);
+    }
+
     debug.push("auto:init-factory");
-    try { await (initCandidate as any)(moduleOptions); debug.push("auto:factory:ok"); } catch (e1: any) {
-      try { await (initCandidate as any)("WORKER", moduleOptions); debug.push("auto:factory:WORKER:ok"); } catch (e2: any) {
+    try {
+      await (initCandidate as any)(moduleOptions);
+      debug.push("auto:factory:ok");
+    } catch (e1: any) {
+      try {
+        await (initCandidate as any)("WORKER", moduleOptions);
+        debug.push("auto:factory:WORKER:ok");
+      } catch (e2: any) {
         return { ok: false, stdout, stderr, debug, error: "autoRun factory failed: " + (e1?.message || e1) + " / " + (e2?.message || e2) };
       }
     }
@@ -180,7 +202,7 @@ function inferContentTypeFromOutput(stdout: string, fallback = "text/plain; char
   if (stdout.includes("<html") || stdout.includes("<!DOCTYPE html")) return "text/html; charset=utf-8";
   return fallback;
 }
-function finalizeOk(url: URL, res: RunResult, defaultCT: string) {
+function finalizeOk(url: URL, res: RunResult, defaultCT: string, extraHeaders?: Record<string, string>) {
   const debugMode = url.searchParams.get("debug") === "1" || url.searchParams.get("showstderr") === "1";
   const stdout = res.stdout.join("\n");
   const filtered = filterKnownNoise(res.stderr, debugMode);
@@ -207,7 +229,7 @@ function finalizeOk(url: URL, res: RunResult, defaultCT: string) {
     body = hint;
     status = 200;
   }
-  return new Response(body, { status, headers: { "content-type": ct } });
+  return new Response(body, { status, headers: { "content-type": ct, ...(extraHeaders || {}) } });
 }
 
 // —— Sources: KV first, then GitHub fallback ——
@@ -361,7 +383,7 @@ async function routeRunPOST(request: Request, url: URL): Promise<Response> {
   }
 }
 
-// 兼容 KV key 结构（带/不带 public 前缀）并支持 GitHub 回退；首页走 -r eval
+// 兼容 KV key 结构（带/不带 public 前缀）并支持 GitHub 回退；首页走“写文件 + 文件执行”避免 -r 过长
 async function routeRepoIndex(url: URL, env: any): Promise<Response> {
   try {
     const ref = url.searchParams.get("ref") || undefined;
@@ -400,16 +422,26 @@ async function routeRepoIndex(url: URL, env: any): Promise<Response> {
       return new Response(codeNormalized!, { status: 200, headers: { "content-type": "text/plain; charset=utf-8", "x-wasmphp-source": sourceTag } });
     }
 
-    const b64 = toBase64Utf8(codeNormalized || "");
-    const oneLiner = wrapCodeWithShutdownNewline(`eval(base64_decode('${b64}'));`);
+    // preRun：用 Module.FS 写入相对路径，避免绝对路径解析差异
+    const relScriptPath = "__wasmphp__/index.php";
+    const preRun: Array<(Module: any) => void> = [
+      (Module: any) => {
+        const FS = Module?.FS;
+        if (!FS) return;
+        try { FS.mkdir("/__wasmphp__"); } catch {}
+        try { FS.unlink("/__wasmphp__/index.php"); } catch {}
+        const code = wrapCodeWithShutdownNewline(codeNormalized!);
+        FS.writeFile("/__wasmphp__/index.php", toUint8(code));
+      }
+    ];
+
     const ini = parseIniParams(url);
-    const argv = buildArgvForCode(oneLiner, ini);
-    const res = await runAuto(argv, 12000);
-    const out = res.ok ? finalizeOk(url, res, "text/html; charset=utf-8") : textResponse((res.stderr.join("\n") || "") + (res.error ? ("\n" + res.error) : "") + "\ntrace: " + res.debug.join("->"), 500);
-    // 附加来源标记
-    const cloned = new Response(await out.text(), { status: out.status, headers: out.headers });
-    cloned.headers.set("x-wasmphp-source", sourceTag || "unknown");
-    return cloned;
+    const argv = buildArgvForFile(relScriptPath, ini); // 传相对路径
+    const res = await runAuto(argv, 12000, preRun);
+    const out = res.ok
+      ? finalizeOk(url, res, "text/html; charset=utf-8", { "x-wasmphp-source": sourceTag || "unknown" })
+      : textResponse((res.stderr.join("\n") || "") + (res.error ? ("\n" + res.error) : "") + "\ntrace: " + res.debug.join("->"), 500);
+    return out;
   } catch (e: any) {
     return textResponse("routeRepoIndex error: " + (e?.stack || String(e)), 500);
   }
@@ -513,7 +545,7 @@ export default {
       if (pathname === "/__jsplus") {
         try {
           const mod = await import("../scripts/php_8_4.js");
-        const def = (mod as any)?.default ?? null;
+          const def = (mod as any)?.default ?? null;
           const hasFactory = typeof def === "function";
           const payload = { imported: true, hasDefaultFactory: hasFactory, exportKeys: Object.keys(mod || {}), note: "import-only, no init" };
           return new Response(JSON.stringify(payload, null, 2), { status: 200, headers: { "content-type": "application/json; charset=utf-8" } });
